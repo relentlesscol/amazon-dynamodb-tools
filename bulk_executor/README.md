@@ -100,6 +100,20 @@ Here are some example use cases:
 ./bulk load --table target --format parquet --s3-path "s3://..."
 
 
+# Import from JDBC-compatible databases (e.g., Amazon Redshift)
+# Import data directly from relational databases into DynamoDB
+./bulk import --table orders --source-type redshift --redshift-connection my-redshift-conn --source-table public.orders
+
+# Import with a WHERE clause for filtering
+./bulk import --table orders --source-type redshift --redshift-connection my-redshift-conn --source-table public.orders --where "order_date > '2024-01-01'"
+
+# Import using a custom SQL query
+./bulk import --table orders --source-type redshift --redshift-connection my-redshift-conn --source-query "SELECT order_id, customer_id, total FROM public.orders WHERE status = 'completed'"
+
+# Import with parallel partitioning for better performance
+./bulk import --table orders --source-type redshift --redshift-connection my-redshift-conn --source-table public.orders --partitionColumn order_id --lowerBound 1 --upperBound 1000000 --numPartitions 10
+
+
 # Run Spark SQL (similar to Athena), with an optional limit
 # See https://spark.apache.org/docs/latest/api/sql/index.html
 ./bulk sql --table target --query "select ..." --limit 100
@@ -324,7 +338,7 @@ The teardown process will not remove any output written to S3 during bulk execut
 
 ## Run the bulk actions
 
-Once you've completed bootstrapping, the regular bulk script actions can be performed by anyone with permission to run the Glue job. There are various actions available out of the box: `count`, `find`, `delete`, `fill`, `update`, `scancount`, `diff`, and `sql`.
+Once you've completed bootstrapping, the regular bulk script actions can be performed by anyone with permission to run the Glue job. There are various actions available out of the box: `count`, `find`, `delete`, `fill`, `update`, `scancount`, `diff`, `load`, `import`, and `sql`.
 
 Executing a bulk job:
 
@@ -461,6 +475,146 @@ If you ever want to stop execution early, you can hit Control-C. The interrupt w
     * `compression`: Specifies the compression codec used. Default: `snappy`. Possible values: `uncompressed`, `snappy`, `gzip`, and `lzo`.
     * `blockSize`: Specifies the size in bytes of a row group being buffered in memory. You use this for tuning performance. Size should divide exactly into a number of megabytes. Default: `134217728` (equal to 128 MB).
     * `pageSize`: Specifies the size in bytes of a page. You use this for tuning performance. A page is the smallest unit that must be read fully to access a single record. Default: `1048576` (equal to 1 MB).
+
+#### `import`
+
+* Imports data from JDBC-compatible relational databases into DynamoDB tables. Currently supports Amazon Redshift with an extensible design for adding PostgreSQL, MySQL, Aurora, and other JDBC sources in the future.
+* Requires a `table` parameter for the target DynamoDB table
+* Requires a `source-type` parameter specifying the database type (currently: `redshift`)
+* Requires a connection parameter based on source type:
+    * `--redshift-connection`: AWS Glue Connection name for Redshift
+* Requires **one of**:
+    * `--source-table`: Direct table name to import from (e.g., `public.orders`)
+    * `--source-query`: Custom SQL query to execute (mutually exclusive with `--source-table`)
+* Optional parameters:
+    * `--where`: WHERE clause for filtering data (only valid with `--source-table`)
+    * `--transformer`: Python script name for custom schema mapping from SQL to NoSQL format
+    * Partitioning parameters for parallel reads (improves performance on large tables):
+        * `--partitionColumn`: Column to partition on (must be numeric)
+        * `--lowerBound`: Lower bound of partition column
+        * `--upperBound`: Upper bound of partition column
+        * `--numPartitions`: Number of partitions to create
+
+**Data Type Conversions**
+
+The `import` verb automatically converts SQL data types to DynamoDB types:
+
+| SQL Type | DynamoDB Type | Notes |
+|----------|---------------|-------|
+| SMALLINT, INTEGER, BIGINT | N (Number) | Stored as numeric values |
+| DECIMAL, NUMERIC, REAL, DOUBLE | N (Number) | Stored as numeric values |
+| VARCHAR, CHAR, TEXT | S (String) | Text data |
+| BOOLEAN, BOOL | BOOL (Boolean) | Boolean values |
+| DATE, TIMESTAMP, TIME | S (String) | Date/time stored as ISO strings |
+| BYTEA, VARBYTE | B (Binary) | Binary data |
+
+**AWS Glue Connection Setup**
+
+Before using the `import` verb, you must create an AWS Glue Connection:
+
+1. Navigate to AWS Glue Console → Connections
+2. Create a new connection with:
+   - Connection type: JDBC
+   - JDBC URL: Your database connection string (e.g., `jdbc:redshift://cluster.region.redshift.amazonaws.com:5439/database`)
+   - Username and password
+   - VPC, subnet, and security group configuration to allow access
+3. Test the connection to ensure it works
+4. Use the connection name with the `--redshift-connection` parameter
+
+**Examples**
+
+```bash
+# Basic import from a Redshift table
+./bulk import --table orders \
+  --source-type redshift \
+  --redshift-connection my-redshift-conn \
+  --source-table public.orders
+
+# Import with filtering
+./bulk import --table recent_orders \
+  --source-type redshift \
+  --redshift-connection my-redshift-conn \
+  --source-table public.orders \
+  --where "order_date >= '2024-01-01' AND status = 'completed'"
+
+# Import using a custom SQL query (for complex joins or aggregations)
+./bulk import --table customer_summary \
+  --source-type redshift \
+  --redshift-connection my-redshift-conn \
+  --source-query "SELECT customer_id, COUNT(*) as order_count, SUM(total) as total_spent FROM public.orders GROUP BY customer_id"
+
+# Import with parallel partitioning for large tables (10 million rows)
+./bulk import --table big_table \
+  --source-type redshift \
+  --redshift-connection my-redshift-conn \
+  --source-table public.large_orders \
+  --partitionColumn order_id \
+  --lowerBound 1 \
+  --upperBound 10000000 \
+  --numPartitions 20
+
+# Import with custom schema transformation
+./bulk import --table transformed_orders \
+  --source-type redshift \
+  --redshift-connection my-redshift-conn \
+  --source-table public.orders \
+  --transformer custom_mapping
+```
+
+**Custom Transformers**
+
+For advanced schema mapping, create a Python transformer script in `bulk_executor/server/src/python_modules/import/` directory:
+
+```python
+# custom_mapping.py
+def transform(record):
+    """
+    Transform SQL record to DynamoDB format.
+    
+    Args:
+        record: Dict with SQL column names and values
+    
+    Returns:
+        Dict suitable for DynamoDB
+    """
+    return {
+        'pk': f"CUSTOMER#{record['customer_id']}",
+        'sk': f"ORDER#{record['order_id']}",
+        'order_date': str(record['order_date']),
+        'total': float(record['total']),
+        'status': record['status']
+    }
+```
+
+**Troubleshooting Common Issues**
+
+*Connection Failures*
+- Verify the AWS Glue Connection is properly configured and tested
+- Check VPC security groups allow traffic between Glue and the database
+- Ensure the database endpoint is accessible from the VPC subnets
+- Verify credentials are correct and have appropriate permissions
+
+*Performance Issues*
+- Use `--partitionColumn` with `--lowerBound`, `--upperBound`, and `--numPartitions` for parallel reads
+- Choose a partition column with even distribution (e.g., auto-incrementing ID)
+- Increase `--XNumberOfWorkers` for larger datasets
+- Use `--XWorkerType` with more memory/CPU (e.g., `G.2X` or `G.4X`)
+
+*Data Type Mismatches*
+- Create a custom transformer script for complex type conversions
+- Check that NULL values are handled appropriately (they're skipped by default)
+- Verify numeric precision matches your requirements
+
+*Query Timeouts*
+- For large queries, use `--XTimeout` to increase the Glue job timeout (default 60 minutes)
+- Consider breaking very large imports into smaller batches using WHERE clauses
+- Use `--source-query` with LIMIT clauses for testing before full import
+
+*Cost Optimization*
+- Use WHERE clauses to import only necessary data
+- Consider `--XExecutionClass FLEX` for lower cost (though longer runtime)
+- Start with fewer workers (`--XNumberOfWorkers`) for small imports
+- Use partitioning to optimize parallel processing efficiency
 
 **`sql`**
 
