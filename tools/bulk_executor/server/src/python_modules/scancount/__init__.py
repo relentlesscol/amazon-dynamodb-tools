@@ -1,6 +1,7 @@
 import importlib
 import json
 import math
+import random
 import sys
 from decimal import Decimal
 
@@ -83,10 +84,14 @@ def run(job, spark_context, glue_context, parsed_args):
     poison_pill_config = PoisonPillConfig(bucket=bucket_name, job_run_id=job_run_id)
     poison_pill_driver = PoisonPillDriver(poison_pill_config)
 
-    # Distribute work among partitions, each knowing what segment it's to handle
+    # Distribute work among partitions, each knowing what segment it's to handle.
+    # Shuffle segment order so concurrently executing workers hit different DynamoDB
+    # partitions, diffusing read traffic instead of concentrating it on adjacent ranges.
     try:
         parallelize_count = segments
-        rdd = spark_context.parallelize(range(parallelize_count), parallelize_count)
+        segment_indices = list(range(parallelize_count))
+        random.shuffle(segment_indices)
+        rdd = spark_context.parallelize(segment_indices, parallelize_count)
         rdd.foreach(lambda worker_id: _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, rate_limiter_shared_config, poison_pill_config))
         rdd.count()
     except Exception as e:
