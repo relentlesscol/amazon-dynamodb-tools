@@ -1,6 +1,6 @@
 # Fork-Based PR Workflow
 
-This project uses a two-tier PR model. **Never open upstream PRs from feature branches.**
+This project uses a two-tier PR model with strict upstream hygiene.
 
 ## Repos
 
@@ -10,26 +10,30 @@ This project uses a two-tier PR model. **Never open upstream PRs from feature br
 ## Rules
 
 1. **Feature branches → fork PRs only.** Every `polecat/*` branch targets `fork/main`. Each PR shows an isolated diff of just that change.
-2. **Fork main → upstream PRs.** When a batch of fork PRs has merged into `fork/main`, open ONE upstream PR from `fork/main` (or a branch cut from it) targeting `origin/main`.
-3. **Never open an upstream PR from a feature branch.** This drags all stacked ancestors into the diff. If you catch yourself doing `--head relentlesscol:polecat/...` against `awslabs`, stop.
-4. **Upstream PR naming:** `[bulk_executor] batch: <summary>` with a body listing each included change.
+2. **Max 3 upstream PRs open at a time.** Each must be independently mergeable in any order — no ordering dependencies between them.
+3. **Upstream PRs are grouped by domain** (e.g., "server-side fixes", "client-side improvements", "CI + tests"). Cherry-pick from fork/main onto origin/main.
+4. **Never open an upstream PR from a feature branch.** This drags all stacked ancestors into the diff.
 5. **Label:** Always add `bulk_executor` label to upstream PRs.
 
 ## Branching
 
 ```
 origin/main (awslabs)
-  └── fork/main (relentlesscol) ← accumulates merged feature PRs
-        ├── polecat/bu-xyz (feature) → PR to fork/main
-        ├── polecat/bu-abc (feature) → PR to fork/main
-        └── upstream-batch-N → PR to origin/main (cut from fork/main)
+  ↑ max 3 PRs, independently mergeable, cherry-picked by domain
+  │
+fork/main (relentlesscol) ← accumulates merged feature PRs
+  ↑ unlimited individual PRs (isolated diffs)
+  │
+polecat/bu-* (feature branches, forked from fork/main)
 ```
 
-## Checklist before opening any PR
+## Upstream PR requirements
 
-- [ ] Target is correct (`fork/main` for features, `origin/main` for batches)
-- [ ] Diff only shows THIS change's files (not ancestors)
-- [ ] Branch was forked from the correct base (not from another feature branch tip)
+- [ ] Max 3 open at once
+- [ ] No ordering dependency — any can merge first
+- [ ] Cherry-picked from fork/main (not from feature branches)
+- [ ] Grouped by domain with clear summary listing each change
+- [ ] Diff only shows files relevant to that domain
 
 ---
 
