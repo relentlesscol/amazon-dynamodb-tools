@@ -133,3 +133,13 @@ class MockRateLimiterWorker:
 
 sys.modules['python_modules.shared.rate_limiter'].RateLimiterWorker = MockRateLimiterWorker
 sys.modules['shared.rate_limiter'].RateLimiterWorker = MockRateLimiterWorker
+
+# Import the real andon_cord module — no pyspark dependency
+_andon_spec = importlib.util.spec_from_file_location(
+    "python_modules.shared.andon_cord",
+    str(_server_src / "python_modules" / "shared" / "andon_cord.py")
+)
+_andon_module = importlib.util.module_from_spec(_andon_spec)
+_andon_spec.loader.exec_module(_andon_module)
+for prefix in ['shared', 'python_modules.shared']:
+    sys.modules[f'{prefix}.andon_cord'] = _andon_module

@@ -21,6 +21,7 @@ from python_modules.shared.rate_limiter import (
     RateLimiterSharedConfig,
     RateLimiterWorker
 )
+from python_modules.shared.andon_cord import AndonCord, is_fatal_error
 from python_modules.shared.table_info import get_dynamodb_throughput_configs
 
 
@@ -112,15 +113,19 @@ def run(job, spark_context, glue_context, parsed_args):
 
     monitor_options = get_dynamodb_throughput_configs(parsed_args, table_name, modes=["write"], format="monitor")
 
+    andon_cord_config = (bucket_name, f"server/andon/{job_run_id}")
+
     # Distribute work among partitions, each told how many items to load
     # Handle exceptions (raised or in accumulator) here so we process once instead of once per worker
     try:
         rdd = spark_context.parallelize(list(enumerate(items_per_worker)), parallelize_count).map(
-                lambda x: _fill_data(monitor_options, table_name, x[1], generate, total_inserted_accumulator, error_accumulator, rate_limiter_shared_config, key_names)).collect()
+                lambda x: _fill_data(monitor_options, table_name, x[1], generate, total_inserted_accumulator, error_accumulator, rate_limiter_shared_config, key_names, andon_cord_config)).collect()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
         rate_limiter_aggregator.shutdown()
+        cord = AndonCord(s3_client=boto3.client("s3"), bucket=bucket_name, prefix=f"server/andon/{job_run_id}")
+        cord.cleanup()
     if error_accumulator.value:
         first_error = error_accumulator.value[0]
         raise Exception(first_error) from None
@@ -128,7 +133,19 @@ def run(job, spark_context, glue_context, parsed_args):
     # Print the total records inserted using the accumulator after all tasks complete
     log.info(f"Total records filled: {total_inserted_accumulator.value:,}")
 
-def _fill_data(monitor_options, table_name, num_items, generate, total_inserted_accumulator, error_accumulator, rate_limiter_shared_config, key_names):
+def _fill_data(monitor_options, table_name, num_items, generate, total_inserted_accumulator, error_accumulator, rate_limiter_shared_config, key_names, andon_cord_config=None):
+    import boto3 as _boto3
+    from python_modules.shared.andon_cord import AndonCord, NullAndonCord, is_fatal_error
+
+    if andon_cord_config:
+        andon_bucket, andon_prefix = andon_cord_config
+        cord = AndonCord(s3_client=_boto3.client("s3"), bucket=andon_bucket, prefix=andon_prefix)
+    else:
+        cord = NullAndonCord()
+
+    if cord.is_pulled():
+        return 0
+
     rate_limiter_worker = RateLimiterWorker(
         shared_config=rate_limiter_shared_config,
         **monitor_options
@@ -151,6 +168,9 @@ def _fill_data(monitor_options, table_name, num_items, generate, total_inserted_
     try:
         with table.batch_writer(overwrite_by_pkeys=key_names) as batch:
             while local_count < num_items:
+                if cord.is_pulled():
+                    break
+
                 try:
                     item_collection = generate()
                     if isinstance(item_collection, dict):
@@ -167,16 +187,20 @@ def _fill_data(monitor_options, table_name, num_items, generate, total_inserted_
                     raise # Others can get handled below
 
     except botocore.exceptions.ClientError as e:
-        if get_error_code(e) == DYNAMO_DB_THROTTLE_EXCEPTION:
+        error_code = get_error_code(e)
+        if error_code == DYNAMO_DB_THROTTLE_EXCEPTION:
             log.info('Persistent throttling on batch_writer exit, give up on last few item inserts...')
-        elif get_error_code(e) == DYNAMO_DB_VALIDATION_EXCEPTION:
+        elif error_code == DYNAMO_DB_VALIDATION_EXCEPTION:
             msg = get_error_message(e)
-            # Offer a little help for "The provided key element does not match" which can be confusing
             if "The provided key element does not match" in msg:
                 msg = f"Perhaps generated items don't match table schema? {msg}"
             error_accumulator.add([f"Schema validation error: {msg}"])
+            cord.pull(worker_id="fill", reason=msg)
         else:
-            error_accumulator.add([f"Error during writing: {get_error_message(e)}"])
+            error_msg = get_error_message(e)
+            error_accumulator.add([f"Error during writing: {error_msg}"])
+            if error_code and is_fatal_error(error_code):
+                cord.pull(worker_id="fill", reason=error_msg)
     finally:
         rate_limiter_worker.shutdown()
 

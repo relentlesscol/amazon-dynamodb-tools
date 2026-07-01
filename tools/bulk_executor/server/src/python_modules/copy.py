@@ -16,10 +16,11 @@ from python_modules.shared.table_info import (
 )
 
 from python_modules.shared.rate_limiter import (
-    RateLimiterAggregator,  
+    RateLimiterAggregator,
     RateLimiterSharedConfig,
     RateLimiterWorker
 )
+from python_modules.shared.andon_cord import AndonCord, is_fatal_error
 
 class ListAccumulator(AccumulatorParam):
     def zero(self, initialValue):
@@ -72,24 +73,41 @@ def run(job, spark_context, glue_context, parsed_args):
     # Since each task might generate errors, let's accumulate them and report intelligently
     error_accumulator = spark_context.accumulator([], ListAccumulator())
 
+    andon_cord_config = (bucket_name, f"server/andon/{job_run_id}")
+
     # Distribute work among partitions, each knowing what segment it's to handle
     try:
         parallelize_count = 400
         rdd = spark_context.parallelize(range(parallelize_count), parallelize_count)
-        rdd.foreach(lambda worker_id: _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config))
+        rdd.foreach(lambda worker_id: _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config, andon_cord_config))
         #rdd.count()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
         source_rate_limiter_aggregator.shutdown()
         target_rate_limiter_aggregator.shutdown()
+        cord = AndonCord(s3_client=boto3.client("s3"), bucket=bucket_name, prefix=f"server/andon/{job_run_id}")
+        cord.cleanup()
     if error_accumulator.value:
         first_error = error_accumulator.value[0]
         raise Exception(first_error) from None
 
     print(f"Total records copied: {total_matched_accumulator.value:,}")
 
-def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config):
+def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config, andon_cord_config=None):
+    import boto3 as _boto3
+    from python_modules.shared.andon_cord import AndonCord, NullAndonCord, is_fatal_error
+    from python_modules.shared.errors import get_error_code
+
+    if andon_cord_config:
+        andon_bucket, andon_prefix = andon_cord_config
+        cord = AndonCord(s3_client=_boto3.client("s3"), bucket=andon_bucket, prefix=andon_prefix)
+    else:
+        cord = NullAndonCord()
+
+    if cord.is_pulled():
+        print(f"Worker {segment}/{total_segments} aborting: andon cord already pulled.")
+        return 0
 
     # Let's hit the gas harder for this verb, at least for now XXX
     source_rl = RateLimiterWorker(
@@ -128,11 +146,14 @@ def _copy_data(source_table, target_table, source_monitor_options, target_monito
     try:
         with dst.batch_writer() as batch:
             while True:
+                if cord.is_pulled():
+                    print(f"Worker {segment}/{total_segments} aborting mid-scan: andon cord pulled.")
+                    break
+
                 resp = src.scan(**scan_kwargs)
 
                 items = resp.get("Items", [])
                 for item in items:
-                    # optionally transform item here
                     batch.put_item(Item=item)
                 local_count += len(items)
 
@@ -141,8 +162,15 @@ def _copy_data(source_table, target_table, source_monitor_options, target_monito
                     break
                 scan_kwargs["ExclusiveStartKey"] = lek
     except Exception as e:
-        error_accumulator.add([f"Error in worker {segment}: {get_error_message(e)}"])
-        # Let control drop down to exit
+        error_msg = get_error_message(e)
+        error_accumulator.add([f"Error in worker {segment}: {error_msg}"])
+        if hasattr(e, 'response'):
+            try:
+                error_code = e.response.get('Error', {}).get('Code')
+                if error_code and is_fatal_error(error_code):
+                    cord.pull(worker_id=str(segment), reason=error_msg)
+            except (AttributeError, TypeError):
+                pass
     finally:
         source_rl.shutdown()
         target_rl.shutdown()

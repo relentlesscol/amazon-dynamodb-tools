@@ -29,6 +29,7 @@ from python_modules.shared.rate_limiter import (
     RateLimiterSharedConfig,
     RateLimiterWorker
 )
+from python_modules.shared.andon_cord import AndonCord, is_fatal_error
 from python_modules.shared.table_info import (
     get_and_print_dynamodb_table_info, get_and_print_table_scan_cost,
     get_dynamodb_throughput_configs)
@@ -77,16 +78,20 @@ def run(job, spark_context, glue_context, parsed_args):
     # Since each task might generate errors, let's accumulate them and report intelligently
     error_accumulator = spark_context.accumulator([], ListAccumulator())
 
+    andon_cord_config = (bucket_name, f"server/andon/{job_run_id}")
+
     # Distribute work among partitions, each knowing what segment it's to handle
     try:
         parallelize_count = 200
         rdd = spark_context.parallelize(range(parallelize_count), parallelize_count)
-        rdd.foreach(lambda worker_id: _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, rate_limiter_shared_config))
+        rdd.foreach(lambda worker_id: _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, rate_limiter_shared_config, andon_cord_config))
         rdd.count()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
         rate_limiter_aggregator.shutdown()
+        cord = AndonCord(s3_client=boto3.client("s3"), bucket=bucket_name, prefix=f"server/andon/{job_run_id}")
+        cord.cleanup()
     if error_accumulator.value:
         first_error = error_accumulator.value[0]
         raise Exception(first_error) from None
@@ -94,7 +99,19 @@ def run(job, spark_context, glue_context, parsed_args):
     # Print the total records inserted using the accumulator after all tasks complete
     print(f"Total records counted: {total_matched_accumulator.value:,}")
 
-def _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, segment, total_segments, total_matched_accumulator, error_accumulator, rate_limiter_shared_config):
+def _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, segment, total_segments, total_matched_accumulator, error_accumulator, rate_limiter_shared_config, andon_cord_config=None):
+    import boto3 as _boto3
+    from python_modules.shared.andon_cord import AndonCord, NullAndonCord, is_fatal_error
+
+    if andon_cord_config:
+        andon_bucket, andon_prefix = andon_cord_config
+        cord = AndonCord(s3_client=_boto3.client("s3"), bucket=andon_bucket, prefix=andon_prefix)
+    else:
+        cord = NullAndonCord()
+
+    if cord.is_pulled():
+        print(f"Worker {segment}/{total_segments} aborting: andon cord already pulled.")
+        return 0
 
     rate_limiter_worker = RateLimiterWorker(
         shared_config=rate_limiter_shared_config,
@@ -132,14 +149,25 @@ def _count_data(monitor_options, table_name, index_name, filter_expression, expr
             scan_kwargs["ExpressionAttributeValues"] = json.loads(expression_values, cls=DecimalEncoder)
 
         while True:
+            if cord.is_pulled():
+                print(f"Worker {segment}/{total_segments} aborting mid-scan: andon cord pulled.")
+                break
+
             response = table.scan(**scan_kwargs) # We do 50 retries within the SDK so shouldn't see a throttle response
             local_count += response.get("Count", 0)
             if "LastEvaluatedKey" not in response:
                 break
             scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
     except Exception as e:
-        error_accumulator.add([f"Error in worker {segment}: {get_error_message(e)}"])
-        # Let control drop down to exit
+        error_msg = get_error_message(e)
+        error_accumulator.add([f"Error in worker {segment}: {error_msg}"])
+        if hasattr(e, 'response'):
+            try:
+                error_code = e.response.get('Error', {}).get('Code')
+                if error_code and is_fatal_error(error_code):
+                    cord.pull(worker_id=str(segment), reason=error_msg)
+            except (AttributeError, TypeError):
+                pass
     finally:
         rate_limiter_worker.shutdown()
 
