@@ -8,6 +8,14 @@ _POISON_KEY_SUFFIX = "poison-pill"
 _CHECK_INTERVAL_SECONDS = 5
 
 
+class PoisonedError(Exception):
+    """Raised when a worker detects the job has been fatally poisoned."""
+
+    def __init__(self, reason=""):
+        self.reason = reason
+        super().__init__(f"Job aborted: {reason}" if reason else "Job aborted")
+
+
 class _NoOpPoisonPill:
     """Placeholder when no poison-pill config is provided. All operations are no-ops."""
 
@@ -16,6 +24,12 @@ class _NoOpPoisonPill:
 
     def check(self):
         return False
+
+    def check_now(self):
+        return False
+
+    def guard(self):
+        pass
 
 
 _NOOP = _NoOpPoisonPill()
@@ -101,6 +115,31 @@ class PoisonPillWorker:
             return False
         except Exception:
             return False
+
+    def check_now(self):
+        """
+        Immediate S3 check, bypassing the rate-limit window.
+
+        Use at worker startup to avoid wasting time on setup when the job
+        is already doomed.
+        """
+        if self._poisoned:
+            return True
+
+        self._last_check = time.monotonic()
+        try:
+            self._s3.head_object(Bucket=self._config.bucket, Key=self._config.key)
+            self._poisoned = True
+            return True
+        except self._s3.exceptions.NoSuchKey:
+            return False
+        except Exception:
+            return False
+
+    def guard(self):
+        """Raise PoisonedError if the job has been aborted."""
+        if self.check_now():
+            raise PoisonedError()
 
     @classmethod
     def is_systemic_error(cls, error):

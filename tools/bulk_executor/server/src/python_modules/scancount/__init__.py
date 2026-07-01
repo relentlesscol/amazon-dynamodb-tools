@@ -23,7 +23,7 @@ class DecimalEncoder(json.JSONDecoder):
 sys.path.append('/server/src')
 from python_modules.shared.errors import *
 from python_modules.shared.logger import log
-from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, _NOOP as _NOOP_POISON_PILL
+from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, PoisonedError, _NOOP as _NOOP_POISON_PILL
 from python_modules.shared.pricing import PricingUtility
 from python_modules.shared.rate_limiter import (
     RateLimiterAggregator,
@@ -198,6 +198,7 @@ def _count_segment(monitor_options, table_name, index_name, filter_expression,
 
 def _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, segment, total_segments, total_matched_accumulator, error_accumulator, rate_limiter_shared_config, poison_pill_config=None):
     poison_pill = PoisonPillWorker(poison_pill_config) if poison_pill_config else _NOOP_POISON_PILL
+    poison_pill.guard()
 
     rate_limiter_worker = RateLimiterWorker(
         shared_config=rate_limiter_shared_config,

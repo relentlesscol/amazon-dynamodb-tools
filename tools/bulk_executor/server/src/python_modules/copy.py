@@ -7,7 +7,7 @@ from pyspark import AccumulatorParam
 
 sys.path.append('/server/src')
 from python_modules.shared.errors import get_error_message
-from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, _NOOP as _NOOP_POISON_PILL
+from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, PoisonedError, _NOOP as _NOOP_POISON_PILL
 from python_modules.shared.table_info import (
     get_and_print_dynamodb_table_info,
     get_and_print_table_scan_cost,
@@ -97,6 +97,7 @@ def run(job, spark_context, glue_context, parsed_args):
 def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config, poison_pill_config=None):
 
     poison_pill = PoisonPillWorker(poison_pill_config) if poison_pill_config else _NOOP_POISON_PILL
+    poison_pill.guard()
 
     # Let's hit the gas harder for this verb, at least for now XXX
     source_rl = RateLimiterWorker(

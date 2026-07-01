@@ -22,6 +22,7 @@ from python_modules.shared.poison_pill import (
     PoisonPillConfig,
     PoisonPillDriver,
     PoisonPillWorker,
+    PoisonedError,
     _CHECK_INTERVAL_SECONDS,
 )
 
@@ -155,6 +156,101 @@ class TestPoisonPillWorkerCheck:
         worker._last_check = 0.0
 
         assert worker.check() is False  # Should not raise
+
+
+class TestPoisonPillWorkerCheckNow:
+    @patch.object(poison_pill_module, "Session")
+    def test_check_now_bypasses_rate_limit(self, mock_session_cls):
+        mock_s3 = MagicMock()
+        no_such_key = type("NoSuchKey", (Exception,), {})
+        mock_s3.exceptions.NoSuchKey = no_such_key
+        mock_s3.head_object.side_effect = no_such_key()
+        mock_session_cls.return_value.client.return_value = mock_s3
+
+        config = PoisonPillConfig(bucket="bkt", job_run_id="jr1")
+        worker = PoisonPillWorker(config)
+        worker._last_check = time.monotonic()  # Just checked
+
+        assert worker.check_now() is False
+        mock_s3.head_object.assert_called_once()
+
+    @patch.object(poison_pill_module, "Session")
+    def test_check_now_returns_true_when_poisoned(self, mock_session_cls):
+        mock_s3 = MagicMock()
+        mock_s3.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        mock_s3.head_object.return_value = {}
+        mock_session_cls.return_value.client.return_value = mock_s3
+
+        config = PoisonPillConfig(bucket="bkt", job_run_id="jr1")
+        worker = PoisonPillWorker(config)
+
+        assert worker.check_now() is True
+        assert worker._poisoned is True
+
+    @patch.object(poison_pill_module, "Session")
+    def test_check_now_skips_s3_when_already_poisoned(self, mock_session_cls):
+        mock_s3 = MagicMock()
+        mock_session_cls.return_value.client.return_value = mock_s3
+
+        config = PoisonPillConfig(bucket="bkt", job_run_id="jr1")
+        worker = PoisonPillWorker(config)
+        worker._poisoned = True
+
+        assert worker.check_now() is True
+        mock_s3.head_object.assert_not_called()
+
+
+class TestPoisonPillWorkerGuard:
+    @patch.object(poison_pill_module, "Session")
+    def test_guard_raises_when_poisoned(self, mock_session_cls):
+        mock_s3 = MagicMock()
+        mock_s3.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        mock_s3.head_object.return_value = {}
+        mock_session_cls.return_value.client.return_value = mock_s3
+
+        config = PoisonPillConfig(bucket="bkt", job_run_id="jr1")
+        worker = PoisonPillWorker(config)
+
+        with pytest.raises(PoisonedError):
+            worker.guard()
+
+    @patch.object(poison_pill_module, "Session")
+    def test_guard_passes_when_not_poisoned(self, mock_session_cls):
+        mock_s3 = MagicMock()
+        no_such_key = type("NoSuchKey", (Exception,), {})
+        mock_s3.exceptions.NoSuchKey = no_such_key
+        mock_s3.head_object.side_effect = no_such_key()
+        mock_session_cls.return_value.client.return_value = mock_s3
+
+        config = PoisonPillConfig(bucket="bkt", job_run_id="jr1")
+        worker = PoisonPillWorker(config)
+
+        worker.guard()  # Should not raise
+
+
+class TestNoOpPoisonPill:
+    def test_check_now_returns_false(self):
+        from python_modules.shared.poison_pill import _NOOP
+        assert _NOOP.check_now() is False
+
+    def test_guard_does_not_raise(self):
+        from python_modules.shared.poison_pill import _NOOP
+        _NOOP.guard()  # Should not raise
+
+
+class TestPoisonedError:
+    def test_with_reason(self):
+        err = PoisonedError("AccessDeniedException")
+        assert "AccessDeniedException" in str(err)
+        assert err.reason == "AccessDeniedException"
+
+    def test_without_reason(self):
+        err = PoisonedError()
+        assert "Job aborted" in str(err)
+        assert err.reason == ""
+
+    def test_is_exception(self):
+        assert issubclass(PoisonedError, Exception)
 
 
 class TestIsSystemicError:

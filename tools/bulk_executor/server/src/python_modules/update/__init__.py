@@ -15,7 +15,7 @@ from pyspark.context import SparkContext
 sys.path.append('/server/src')
 from python_modules.shared.errors import *
 from python_modules.shared.logger import log
-from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, _NOOP as _NOOP_POISON_PILL
+from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, PoisonedError, _NOOP as _NOOP_POISON_PILL
 from python_modules.shared.pricing import PricingUtility
 from python_modules.shared.rate_limiter import (
     RateLimiterAggregator,
@@ -100,6 +100,7 @@ def run(job, spark_context, glue_context, parsed_args):
 
 def _update_data(monitor_options, table_name, generate, segment, total_segments, updated_accumulator, skipped_accumulator, failed_accumulator, error_accumulator, rate_limiter_shared_config, poison_pill_config=None):
     poison_pill = PoisonPillWorker(poison_pill_config) if poison_pill_config else _NOOP_POISON_PILL
+    poison_pill.guard()
 
     rate_limiter_worker = RateLimiterWorker(
         shared_config=rate_limiter_shared_config,

@@ -12,7 +12,7 @@ from pyspark.sql.functions import asc, desc
 # Custom Library Imports
 sys.path.append('/server/src')
 from python_modules.shared.errors import *
-from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, _NOOP as _NOOP_POISON_PILL
+from python_modules.shared.poison_pill import PoisonPillConfig, PoisonPillDriver, PoisonPillWorker, PoisonedError, _NOOP as _NOOP_POISON_PILL
 from python_modules.shared.pricing import PricingUtility
 from python_modules.shared.rate_limiter import (
     RateLimiterAggregator,
@@ -177,6 +177,7 @@ def run(job, spark_context, glue_context, parsed_args):
 
             def delete_partition(monitor_options, partition, shared_config, pp_config):
                 poison_pill = PoisonPillWorker(pp_config)
+                poison_pill.guard()
                 rate_limiter_worker = RateLimiterWorker(
                     shared_config=rate_limiter_shared_config,
                     **monitor_options
