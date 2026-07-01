@@ -92,6 +92,12 @@ def validate_idle_timeout(x):
         raise argparse.ArgumentTypeError(f"IdleTimeout must be an integer")
 
 
+def validate_role(value):
+    if not value or not value.strip():
+        raise argparse.ArgumentTypeError("Role name must not be empty.")
+    return value
+
+
 # The defaults stated below should perhaps be dynamic from constants.py
 def parse_action():
     parser = argparse.ArgumentParser(

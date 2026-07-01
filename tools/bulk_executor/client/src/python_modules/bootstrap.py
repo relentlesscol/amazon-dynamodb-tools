@@ -3,7 +3,7 @@ import logging as log
 
 import utils
 from infrastructure import BootstrapInfrastructure
-from infrastructure.constants import READ_WRITE_ROLE_TYPES
+from utils import validate_role
 from utils.custom_parser import BulkArgumentParser
 
 help_text = f"""
@@ -18,13 +18,6 @@ help_text = f"""
     Examples:
         bulk bootstrap
     """
-
-def validate_role(value):
-    if value in READ_WRITE_ROLE_TYPES or value.startswith("AWSGlueServiceRole"):
-        return value
-    raise argparse.ArgumentTypeError(
-        f"Invalid role: '{value}'. Must be READ-ONLY, READ-WRITE, or start with 'AWSGlueServiceRole'."
-    )
 
 def run(env_configs):
     glue_job_parent = utils.glue_job_arguments()

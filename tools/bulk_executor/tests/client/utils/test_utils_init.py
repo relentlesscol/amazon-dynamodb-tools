@@ -56,6 +56,7 @@ from utils import (
     glue_job_arguments,
     parse_action,
     parse_environment_arguments,
+    validate_role,
     validate_tables,
     validate_timeout,
     warn,
@@ -730,3 +731,30 @@ class TestRegionFromTableRef:
         """ARN for dynamodb but resource isn't a table (e.g. backup)."""
         arn = 'arn:aws:dynamodb:us-east-1:111122223333:backup/foo'
         assert _region_from_table_ref(arn) is None
+
+
+# --- validate_role ----------------------------------------------------------
+
+class TestValidateRole:
+    """Tests for validate_role — accepts any non-empty role name."""
+
+    def test_standard_role_types_pass_through(self):
+        assert validate_role('READ-ONLY') == 'READ-ONLY'
+        assert validate_role('READ-WRITE') == 'READ-WRITE'
+
+    def test_custom_role_name_accepted(self):
+        assert validate_role('MyCustomGlueRole') == 'MyCustomGlueRole'
+
+    def test_glue_service_role_prefix_accepted(self):
+        assert validate_role('AWSGlueServiceRole-MyJob') == 'AWSGlueServiceRole-MyJob'
+
+    def test_arbitrary_role_name_accepted(self):
+        assert validate_role('my-team-data-pipeline-role') == 'my-team-data-pipeline-role'
+
+    def test_empty_string_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="must not be empty"):
+            validate_role('')
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="must not be empty"):
+            validate_role('   ')
