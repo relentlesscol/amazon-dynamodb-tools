@@ -556,7 +556,7 @@ def _parse_arn(arn: str) -> dict:
         "resource": resource,
     }
 
-def _region_from_table_ref(table_ref: str) -> str | None:
+def _region_from_table_ref(table_ref: str):
     if not table_ref or not table_ref.startswith("arn:"):
         return None
     arn = _parse_arn(table_ref)

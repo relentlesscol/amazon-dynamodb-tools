@@ -73,7 +73,7 @@ def run(job, spark_context, glue_context, parsed_args):
     DO_FIND = glue_job_action == 'find'
 
     # Print the table info, and use a generator in case we need to resume for the deletes
-    print_pricing_generator = print_dynamodb_table_info(DYNAMO_DB_TABLE_NAME, DO_DELETE, **kwargs)
+    print_pricing_generator = print_dynamodb_table_info(DYNAMO_DB_TABLE_NAME, DO_DELETE)
     item_count = next(print_pricing_generator)
 
     # We want to convert a string like "foo asc, bar desc" into an object array [asc(foo), desc(bar)]
