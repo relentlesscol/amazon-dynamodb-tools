@@ -194,6 +194,49 @@ class TestRateSetters:
             monitor.max_write_rate = 0
 
 
+class TestRateWarnings:
+    def test_warns_on_too_high_read_rate_init(self, mock_session, caplog):
+        with caplog.at_level("WARNING"):
+            m = DynamoDBMonitor(mock_session, max_read_rate=50000, max_write_rate=500, enable_reporting=False)
+        assert "Read rate 50,000 exceeds 40,000 CU/s" in caplog.text
+        m.stop()
+
+    def test_warns_on_too_high_write_rate_init(self, mock_session, caplog):
+        with caplog.at_level("WARNING"):
+            m = DynamoDBMonitor(mock_session, max_read_rate=500, max_write_rate=100000, enable_reporting=False)
+        assert "Write rate 100,000 exceeds 40,000 CU/s" in caplog.text
+        m.stop()
+
+    def test_warns_on_too_low_read_rate_init(self, mock_session, caplog):
+        with caplog.at_level("WARNING"):
+            m = DynamoDBMonitor(mock_session, max_read_rate=50, max_write_rate=500, enable_reporting=False)
+        assert "Read rate 50 is very low" in caplog.text
+        m.stop()
+
+    def test_warns_on_too_low_write_rate_init(self, mock_session, caplog):
+        with caplog.at_level("WARNING"):
+            m = DynamoDBMonitor(mock_session, max_read_rate=500, max_write_rate=10, enable_reporting=False)
+        assert "Write rate 10 is very low" in caplog.text
+        m.stop()
+
+    def test_no_warning_for_normal_rates(self, mock_session, caplog):
+        with caplog.at_level("WARNING"):
+            m = DynamoDBMonitor(mock_session, max_read_rate=1000, max_write_rate=500, enable_reporting=False)
+        assert "exceeds" not in caplog.text
+        assert "very low" not in caplog.text
+        m.stop()
+
+    def test_warns_on_too_high_read_rate_setter(self, monitor, caplog):
+        with caplog.at_level("WARNING"):
+            monitor.max_read_rate = 50000
+        assert "Read rate 50,000 exceeds 40,000 CU/s" in caplog.text
+
+    def test_warns_on_too_low_write_rate_setter(self, monitor, caplog):
+        with caplog.at_level("WARNING"):
+            monitor.max_write_rate = 5
+        assert "Write rate 5 is very low" in caplog.text
+
+
 class TestReporting:
     def test_reporting_thread_starts_when_enabled(self, mock_session):
         m = DynamoDBMonitor(mock_session, max_read_rate=100, max_write_rate=50, enable_reporting=True)

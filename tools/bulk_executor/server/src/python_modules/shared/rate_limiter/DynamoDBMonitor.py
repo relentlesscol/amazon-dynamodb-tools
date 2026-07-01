@@ -1,7 +1,28 @@
+import logging
 import threading
 import time
 from collections import defaultdict
 from .TokenBucket import TokenBucket
+
+logger = logging.getLogger(__name__)
+
+MIN_WARN_RATE = 100
+MAX_WARN_RATE = 40000
+
+
+def _check_rate_value(value, direction):
+    """Emit a warning if rate is technically valid but suspiciously high or low."""
+    if value > MAX_WARN_RATE:
+        logger.warning(
+            f"{direction.capitalize()} rate {value:,.0f} exceeds {MAX_WARN_RATE:,} CU/s. "
+            f"This may cause heavy throttling unless table capacity supports it."
+        )
+    elif value < MIN_WARN_RATE:
+        logger.warning(
+            f"{direction.capitalize()} rate {value:,.0f} is very low (< {MIN_WARN_RATE} CU/s). "
+            f"This will result in an extremely slow job."
+        )
+
 
 class DynamoDBMonitor:
     def __init__(self, session, max_read_rate=1500, max_write_rate=500, enable_reporting=True):
@@ -10,6 +31,8 @@ class DynamoDBMonitor:
                 f"Invalid rate limits: read={max_read_rate}, write={max_write_rate}. "
                 "Both must be >= 1 capacity units per second."
             )
+        _check_rate_value(max_read_rate, "read")
+        _check_rate_value(max_write_rate, "write")
         # Private copies
         self._max_read_rate  = float(max_read_rate)
         self._max_write_rate = float(max_write_rate)
@@ -43,11 +66,11 @@ class DynamoDBMonitor:
     def max_write_rate(self) -> float:
         return self._max_write_rate
 
-    # setters that *apply* to buckets
     @max_read_rate.setter
     def max_read_rate(self, value: float):
         if value < 1:
             raise ValueError("read rate must be >= 1")
+        _check_rate_value(value, "read")
         self._max_read_rate = float(value)
         self._read_bucket.reconfigure(rate=self._max_read_rate,
                                       capacity=self._max_read_rate * self._capacity_multiplier,
@@ -57,6 +80,7 @@ class DynamoDBMonitor:
     def max_write_rate(self, value: float):
         if value < 1:
             raise ValueError("write rate must be >= 1")
+        _check_rate_value(value, "write")
         self._max_write_rate = float(value)
         self._write_bucket.reconfigure(rate=self._max_write_rate,
                                        capacity=self._max_write_rate * self._capacity_multiplier,
