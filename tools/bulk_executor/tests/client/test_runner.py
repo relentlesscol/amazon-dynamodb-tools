@@ -910,6 +910,21 @@ class TestStartGlueJob:
         assert kwargs['Timeout'] == 30
         assert kwargs['WorkerType'] == 'G.2X'
 
+    def test_idle_timeout_omitted_when_not_specified(self, bulk_runner):
+        """XIdleTimeout is not passed to Glue when absent from args."""
+        bulk_runner.glue_client.start_job_run.return_value = {'JobRunId': 'x'}
+        bulk_runner._start_glue_job({}, {})
+        kwargs = bulk_runner.glue_client.start_job_run.call_args.kwargs
+        assert 'WorkerIdleTimeout' not in kwargs
+
+    def test_idle_timeout_passed_when_specified(self, bulk_runner):
+        """XIdleTimeout is forwarded as WorkerIdleTimeout to start_job_run."""
+        bulk_runner.glue_client.start_job_run.return_value = {'JobRunId': 'x'}
+        args = {'XIdleTimeout': 5}
+        bulk_runner._start_glue_job({}, args)
+        kwargs = bulk_runner.glue_client.start_job_run.call_args.kwargs
+        assert kwargs['WorkerIdleTimeout'] == 5
+
     def test_expired_token_exception_exits(self, bulk_runner):
         err = ClientError(
             {'Error': {'Code': 'ExpiredTokenException', 'Message': 'expired'}},
