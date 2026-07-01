@@ -80,6 +80,16 @@ def validate_timeout(x):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Timeout must be an integer")
 
+def validate_idle_timeout(x):
+    try:
+        value = int(x)
+        if 1 <= value <= 10080:
+            return value
+        else:
+            raise argparse.ArgumentTypeError(f"Idle timeout must be between 1 and 10080 minutes")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Idle timeout must be an integer")
+
 
 # The defaults stated below should perhaps be dynamic from constants.py
 def parse_action():
@@ -98,6 +108,7 @@ def glue_job_arguments():
 
     parser.add_argument("--XExecutionClass", type=str, default=argparse.SUPPRESS, help="Set to STANDARD (default) or FLEX (lower DPU cost by using spare capacity, may take longer).", choices=SUPPORTED_EXECUTION_CLASSES)
     parser.add_argument("--XTimeout", type=validate_timeout, default=argparse.SUPPRESS, help="The Glue Job timeout (in minutes). Must be between 1 and 10080 minutes (7 days is the max allowed timeout). Default is 60 minutes.")
+    parser.add_argument("--XIdleTimeout", type=validate_idle_timeout, default=argparse.SUPPRESS, help="Worker idle timeout (in minutes). Workers that remain idle longer than this are shut down to reduce cost. Must be between 1 and 10080 minutes.")
     parser.add_argument("--XNumberOfWorkers", type=int, default=argparse.SUPPRESS, help="The number of Glue workers (default 220).")
     parser.add_argument("--XWorkerType", type=str, default=argparse.SUPPRESS, help="The Glue worker type. ex. G.1X", choices=SUPPORTED_WORKER_TYPES)
     parser.add_argument("--XWaitForDPU", action='store_true', default=argparse.SUPPRESS, help="Causes execution to wait 40 seconds at the end of execution for DPU metrics to be available.")

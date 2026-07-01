@@ -273,12 +273,28 @@ class TestGlueJobArguments:
         assert ns.XMaxWriteRate == 1000
         assert ns.XMaxReadRate == 500
 
+    def test_parses_idle_timeout(self):
+        parser = glue_job_arguments()
+        ns, _ = parser.parse_known_args(['--XIdleTimeout', '5'])
+        assert ns.XIdleTimeout == 5
+
+    def test_idle_timeout_rejects_out_of_range(self, capsys):
+        parser = glue_job_arguments()
+        with pytest.raises(SystemExit):
+            parser.parse_known_args(['--XIdleTimeout', '0'])
+
+    def test_idle_timeout_rejects_above_max(self, capsys):
+        parser = glue_job_arguments()
+        with pytest.raises(SystemExit):
+            parser.parse_known_args(['--XIdleTimeout', '10081'])
+
     def test_default_attribute_suppressed_when_unset(self):
         """SUPPRESS default means unset args don't appear on the namespace."""
         parser = glue_job_arguments()
         ns, _ = parser.parse_known_args([])
         assert not hasattr(ns, 'XExecutionClass')
         assert not hasattr(ns, 'XTimeout')
+        assert not hasattr(ns, 'XIdleTimeout')
 
 
 class TestEnvironmentArguments:

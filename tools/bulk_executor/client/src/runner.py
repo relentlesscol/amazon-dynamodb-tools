@@ -367,7 +367,7 @@ class BulkDynamoDbRunner:
 
     def _start_glue_job(self, glue_job_arguments, args):
         try:
-            response = self.glue_client.start_job_run(
+            start_params = dict(
                 JobName=GLUE_JOB_NAME,
                 Arguments=glue_job_arguments,
                 ExecutionClass=args.get('XExecutionClass', GlueJobDefaults.ExecutionClass.value),
@@ -375,6 +375,9 @@ class BulkDynamoDbRunner:
                 Timeout=args.get('XTimeout', GlueJobDefaults.Timeout.value),
                 WorkerType=args.get('XWorkerType', GlueJobDefaults.WorkerType.value),
             )
+            if args.get('XIdleTimeout') is not None:
+                start_params['WorkerIdleTimeout'] = args['XIdleTimeout']
+            response = self.glue_client.start_job_run(**start_params)
             return response['JobRunId']
         except Exception as e:
             log.error('Error starting Bulk Executor Glue Job!')
