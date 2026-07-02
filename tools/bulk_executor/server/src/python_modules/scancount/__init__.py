@@ -41,6 +41,15 @@ class ListAccumulator(AccumulatorParam):
         v1.extend(v2)
         return v1
 
+class DictAccumulator(AccumulatorParam):
+    def zero(self, initialValue):
+        return {}
+
+    def addInPlace(self, v1, v2):
+        for k, v in v2.items():
+            v1[k] = v1.get(k, 0) + v
+        return v1
+
 DYNAMO_DB_THROTTLE_EXCEPTION = 'ProvisionedThroughputExceededException'
 DYNAMO_DB_VALIDATION_EXCEPTION = 'ValidationException'
 
@@ -77,11 +86,16 @@ def run(job, spark_context, glue_context, parsed_args):
     # Since each task might generate errors, let's accumulate them and report intelligently
     error_accumulator = spark_context.accumulator([], ListAccumulator())
 
+    persegment = parsed_args.get('persegment', False)
+    per_segment_accumulator = None
+    if persegment:
+        per_segment_accumulator = spark_context.accumulator({}, DictAccumulator())
+
     # Distribute work among partitions, each knowing what segment it's to handle
     try:
         parallelize_count = 200
         rdd = spark_context.parallelize(range(parallelize_count), parallelize_count)
-        rdd.foreach(lambda worker_id: _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, rate_limiter_shared_config))
+        rdd.foreach(lambda worker_id: _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, rate_limiter_shared_config, per_segment_accumulator))
         rdd.count()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
@@ -94,7 +108,12 @@ def run(job, spark_context, glue_context, parsed_args):
     # Print the total records inserted using the accumulator after all tasks complete
     print(f"Total records counted: {total_matched_accumulator.value:,}")
 
-def _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, segment, total_segments, total_matched_accumulator, error_accumulator, rate_limiter_shared_config):
+    if persegment and per_segment_accumulator is not None:
+        print("\nPer-segment counts:")
+        for seg in sorted(per_segment_accumulator.value.keys()):
+            print(f"  Segment {seg}: {per_segment_accumulator.value[seg]:,}")
+
+def _count_data(monitor_options, table_name, index_name, filter_expression, expression_values, expression_names, segment, total_segments, total_matched_accumulator, error_accumulator, rate_limiter_shared_config, per_segment_accumulator=None):
 
     rate_limiter_worker = RateLimiterWorker(
         shared_config=rate_limiter_shared_config,
@@ -145,4 +164,6 @@ def _count_data(monitor_options, table_name, index_name, filter_expression, expr
 
     print(f"Worker {segment}/{total_segments} counted {local_count} records.")
     total_matched_accumulator.add(local_count)
+    if per_segment_accumulator is not None:
+        per_segment_accumulator.add({segment: local_count})
     return local_count
