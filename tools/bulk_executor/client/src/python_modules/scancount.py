@@ -41,6 +41,7 @@ def run(env_configs):
     parser.add_argument('--expression-names', type=json_type, default=argparse.SUPPRESS, help='Expression names to use')
     parser.add_argument('--expression-values', type=json_type, default=argparse.SUPPRESS, help='Expression values to use')
     parser.add_argument('--index', type=str, default=argparse.SUPPRESS, help='Index to use')
+    parser.add_argument('--persegment', action='store_true', default=argparse.SUPPRESS, help='Print per-segment counts')
     args = parser.parse_args()
 
     if hasattr(args, "filter_expression"):
