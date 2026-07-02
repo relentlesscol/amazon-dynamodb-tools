@@ -281,11 +281,14 @@ def diff_segment(stream_a_name, stream_b_name, monitor_options_a, monitor_option
         rate_limiter_worker_a.shutdown()
         rate_limiter_worker_b.shutdown()
 
-    if use_s3:
+    # Always write to S3 when bucket is available (issue #86)
+    if bucket:
         boto3.client('s3').put_object(Body="\n".join(diff), Bucket=bucket, Key=f"{job_id}/{segment}.txt")
+
+    if use_s3:
         return len(diff)
 
-    return diff[0:PRINT_LIMIT]
+    return diff if bucket else diff[0:PRINT_LIMIT]
 
 def print_dynamodb_table_info(table_name, fraction=1.0):
     region_name = boto3.Session().region_name
@@ -378,7 +381,7 @@ def run(job, spark_context, glue_context, parsed_args):
         if count == 0:
             print("No differences found")
         elif count <= PRINT_LIMIT:
-            print(f"There are {count} differences.")
+            print(f"There are {count} differences. Full output at s3://{bucket}/{job_id}/")
         else:
-            print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}. Use the --s3 flag to store them all in S3.")
+            print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}. Full output at s3://{bucket}/{job_id}/")
     print()
