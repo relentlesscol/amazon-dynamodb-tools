@@ -299,7 +299,6 @@ def run(job, spark_context, glue_context, parsed_args):
     table1 = parsed_args.get('table')
     table2 = parsed_args.get('table2')
     diff_type = parsed_args.get('format', 'keys') # keys or full
-    use_s3 = parsed_args.get('s3')
     job_id = parsed_args.get("JOB_RUN_ID")
     bucket = parsed_args.get('s3-bucket-name')
 
@@ -355,13 +354,13 @@ def run(job, spark_context, glue_context, parsed_args):
     monitor_options_2 = get_dynamodb_throughput_configs(parsed_args, table2, modes=("read"), format="monitor")
 
     try:
-        rdd2 = rdd.map(lambda worker_id: diff_segment(table1, table2, monitor_options_1, monitor_options_2, worker_id, splits, False, diff_type == 'keys', job_id, use_s3, bucket, broadcast_schema, rate_limiter_shared_config)).collect()
+        rdd2 = rdd.map(lambda worker_id: diff_segment(table1, table2, monitor_options_1, monitor_options_2, worker_id, splits, False, diff_type == 'keys', job_id, True, bucket, broadcast_schema, rate_limiter_shared_config)).collect()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
         rate_limiter_aggregator.shutdown()
 
-    if use_s3:
+    if rdd2 and isinstance(rdd2[0], int):
         total = sum(rdd2)
         if total == 0:
             print("No differences found")
@@ -380,5 +379,5 @@ def run(job, spark_context, glue_context, parsed_args):
         elif count <= PRINT_LIMIT:
             print(f"There are {count} differences.")
         else:
-            print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}. Use the --s3 flag to store them all in S3.")
+            print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}.")
     print()
