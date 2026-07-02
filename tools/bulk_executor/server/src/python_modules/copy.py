@@ -72,11 +72,13 @@ def run(job, spark_context, glue_context, parsed_args):
     # Since each task might generate errors, let's accumulate them and report intelligently
     error_accumulator = spark_context.accumulator([], ListAccumulator())
 
+    transformer = parsed_args.get('transformer')
+
     # Distribute work among partitions, each knowing what segment it's to handle
     try:
         parallelize_count = 400
         rdd = spark_context.parallelize(range(parallelize_count), parallelize_count)
-        rdd.foreach(lambda worker_id: _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config))
+        rdd.foreach(lambda worker_id: _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, worker_id, parallelize_count, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config, transformer=transformer))
         #rdd.count()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
@@ -89,7 +91,7 @@ def run(job, spark_context, glue_context, parsed_args):
 
     print(f"Total records copied: {total_matched_accumulator.value:,}")
 
-def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config):
+def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config, transformer=None):
 
     # Let's hit the gas harder for this verb, at least for now XXX
     source_rl = RateLimiterWorker(
@@ -132,7 +134,10 @@ def _copy_data(source_table, target_table, source_monitor_options, target_monito
 
                 items = resp.get("Items", [])
                 for item in items:
-                    # optionally transform item here
+                    if transformer is not None:
+                        item = transformer(item)
+                        if item is None:
+                            continue
                     batch.put_item(Item=item)
                 local_count += len(items)
 
