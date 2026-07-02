@@ -76,10 +76,27 @@ def run(job, spark_context, glue_context, parsed_args):
     error_accumulator = spark_context.accumulator([], ListAccumulator())
 
     # Distribute work among partitions, each knowing what segment it's to handle
+    two_phase = parsed_args.get('two-phase', False)
+
     try:
         parallelize_count = 800
         rdd = spark_context.parallelize(range(parallelize_count), parallelize_count)
-        rdd.map(lambda worker_id: _update_data(monitor_options, table_name, generate, worker_id, parallelize_count, updated_accumulator, skipped_accumulator, failed_accumulator, error_accumulator, rate_limiter_shared_config)).collect()
+
+        if two_phase:
+            # Two-phase mode: scan → repartition → write
+            # Phase 1: Scan segments and collect update commands without writing
+            rdd.map(lambda worker_id: _scan_data(
+                monitor_options, table_name, generate, worker_id, parallelize_count,
+                error_accumulator, rate_limiter_shared_config
+            )).flatMap(lambda commands: commands).repartition(parallelize_count).map(
+                lambda cmd: _write_command(
+                    monitor_options, table_name, cmd,
+                    updated_accumulator, skipped_accumulator, failed_accumulator,
+                    error_accumulator, rate_limiter_shared_config
+                )
+            ).collect()
+        else:
+            rdd.map(lambda worker_id: _update_data(monitor_options, table_name, generate, worker_id, parallelize_count, updated_accumulator, skipped_accumulator, failed_accumulator, error_accumulator, rate_limiter_shared_config)).collect()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
@@ -160,4 +177,86 @@ def _update_data(monitor_options, table_name, generate, segment, total_segments,
     updated_accumulator.add(updated_count)
     skipped_accumulator.add(skipped_count)
     failed_accumulator.add(failed_count)
+    return 0
+
+def _scan_data(monitor_options, table_name, generate, segment, total_segments, error_accumulator, rate_limiter_shared_config):
+    """Phase 1 of two-phase mode: scan segment and return update commands without writing."""
+    rate_limiter_worker = RateLimiterWorker(
+        shared_config=rate_limiter_shared_config,
+        **monitor_options
+    )
+
+    session = rate_limiter_worker.get_session()
+    dynamodb_resource = session.resource('dynamodb', config=Config(
+        connect_timeout=4.0,
+        read_timeout=4.0,
+        retries={
+            'mode': 'standard',
+            'total_max_attempts': 50
+        }
+    ))
+
+    table = dynamodb_resource.Table(table_name)
+    commands = []
+    scan_kwargs = {
+        "TableName": table_name,
+        "Segment": segment,
+        "TotalSegments": total_segments
+    }
+
+    try:
+        while True:
+            response = table.scan(**scan_kwargs)
+            for item in response.get("Items", []):
+                update_kwargs = generate(item)
+                if update_kwargs:
+                    commands.append(update_kwargs)
+            if "LastEvaluatedKey" not in response:
+                break
+            scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    except Exception as e:
+        error_accumulator.add([f"Error in scan worker {segment}: {get_error_message(e)}"])
+    finally:
+        rate_limiter_worker.shutdown()
+
+    print(f"Scan worker {segment}/{total_segments} collected {len(commands):,} commands")
+    return commands
+
+def _write_command(monitor_options, table_name, cmd, updated_accumulator, skipped_accumulator, failed_accumulator, error_accumulator, rate_limiter_shared_config):
+    """Phase 2 of two-phase mode: execute a single update command."""
+    rate_limiter_worker = RateLimiterWorker(
+        shared_config=rate_limiter_shared_config,
+        **monitor_options
+    )
+
+    session = rate_limiter_worker.get_session()
+    dynamodb_resource = session.resource('dynamodb', config=Config(
+        connect_timeout=4.0,
+        read_timeout=4.0,
+        retries={
+            'mode': 'standard',
+            'total_max_attempts': 50
+        }
+    ))
+
+    table = dynamodb_resource.Table(table_name)
+
+    try:
+        table.update_item(**cmd)
+        updated_accumulator.add(1)
+    except botocore.exceptions.ClientError as e:
+        error_code = get_error_code(e)
+        if error_code == DYNAMO_DB_THROTTLE_EXCEPTION:
+            error_accumulator.add([f"Throttling observed despite massive retries"])
+        elif error_code == DYNAMO_DB_VALIDATION_EXCEPTION:
+            error_accumulator.add([f"Validation exception: {get_error_message(e)}"])
+        elif error_code == DYNAMO_DB_CONDITIONAL_CHECK_FAILED:
+            failed_accumulator.add(1)
+        else:
+            error_accumulator.add([f"Unhandled ClientError: {get_error_message(e)}"])
+    except Exception as e:
+        error_accumulator.add([f"Error in write worker: {get_error_message(e)}"])
+    finally:
+        rate_limiter_worker.shutdown()
+
     return 0
