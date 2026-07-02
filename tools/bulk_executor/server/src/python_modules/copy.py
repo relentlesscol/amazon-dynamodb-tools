@@ -89,7 +89,7 @@ def run(job, spark_context, glue_context, parsed_args):
 
     print(f"Total records copied: {total_matched_accumulator.value:,}")
 
-def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config):
+def _copy_data(source_table, target_table, source_monitor_options, target_monitor_options, segment, total_segments, total_matched_accumulator, error_accumulator, source_rate_limiter_shared_config, target_rate_limiter_shared_config, transformer=None):
 
     # Let's hit the gas harder for this verb, at least for now XXX
     source_rl = RateLimiterWorker(
@@ -132,7 +132,10 @@ def _copy_data(source_table, target_table, source_monitor_options, target_monito
 
                 items = resp.get("Items", [])
                 for item in items:
-                    # optionally transform item here
+                    if transformer is not None:
+                        item = transformer(item)
+                        if item is None:
+                            continue
                     batch.put_item(Item=item)
                 local_count += len(items)
 
