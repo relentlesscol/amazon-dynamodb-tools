@@ -371,6 +371,7 @@ class BulkDynamoDbRunner:
                 JobName=GLUE_JOB_NAME,
                 Arguments=glue_job_arguments,
                 ExecutionClass=args.get('XExecutionClass', GlueJobDefaults.ExecutionClass.value),
+                IdleTimeout=args.get('XIdleTimeout', GlueJobDefaults.IdleTimeout.value),
                 NumberOfWorkers=args.get('XNumberOfWorkers', GlueJobDefaults.NumberOfWorkers.value),
                 Timeout=args.get('XTimeout', GlueJobDefaults.Timeout.value),
                 WorkerType=args.get('XWorkerType', GlueJobDefaults.WorkerType.value),

@@ -35,6 +35,7 @@ PYTHON_MODULE_SERVER_ZIP_PATH = 'server/src/python_modules.zip'
 
 class GlueJobDefaults(Enum):
     ExecutionClass='STANDARD'
+    IdleTimeout=1
     MaxConcurrentRuns=20
     Retries=0
     Timeout=60
