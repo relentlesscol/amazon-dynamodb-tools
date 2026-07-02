@@ -339,6 +339,9 @@ def run(job, spark_context, glue_context, parsed_args):
         'table2': {'pk': pk2, 'sk': sk2}
     })
 
+    # Shuffle segment order so concurrently executing workers hit different DynamoDB
+    # partitions, diffusing read traffic instead of concentrating it on adjacent ranges.
+    random.shuffle(segment_indices)
     try:
         rdd = spark_context.parallelize(segment_indices, len(segment_indices))
     except Exception as e:
