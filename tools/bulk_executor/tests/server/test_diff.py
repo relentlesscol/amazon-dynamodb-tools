@@ -1129,6 +1129,48 @@ class TestRun:
         segment_list = call_args.args[0]
         assert len(segment_list) == 400
 
+    def test_always_writes_to_s3_even_without_s3_flag(self, monkeypatch, capsys):
+        """Issue #86: diff should always write output to S3 and print the S3 link,
+        even when --s3 flag is not provided. Like `find`, large output should always
+        go to S3 with the first portion shown on console."""
+        self._setup_run_mocks(monkeypatch)
+        args = self._base_args()
+        args['s3'] = None  # Explicitly: no --s3 flag
+
+        spark_context = MagicMock()
+        rdd = MagicMock()
+        spark_context.parallelize.return_value = rdd
+        # Simulate diff_segment returning counts (S3 mode behavior: returns int per segment)
+        rdd.map.return_value.collect.return_value = [5, 3, 0, 2]
+
+        diff_module.run(MagicMock(), spark_context, MagicMock(), args)
+        out = capsys.readouterr().out
+
+        # Must always print the S3 output location
+        assert 's3://bucket/job-1/' in out
+        # Must report total differences
+        assert '10 differences' in out
+
+    def test_no_s3_flag_does_not_suggest_using_s3_flag(self, monkeypatch, capsys):
+        """Issue #86: After always writing to S3, the 'Use the --s3 flag' suggestion
+        should no longer appear since S3 output is now the default behavior."""
+        self._setup_run_mocks(monkeypatch)
+        args = self._base_args()
+        args['s3'] = None  # No --s3 flag
+
+        spark_context = MagicMock()
+        rdd = MagicMock()
+        spark_context.parallelize.return_value = rdd
+        # Return enough diffs to trigger the truncation message in current code
+        diffs = [f'- item{i}' for i in range(150)]
+        rdd.map.return_value.collect.return_value = [diffs]
+
+        diff_module.run(MagicMock(), spark_context, MagicMock(), args)
+        out = capsys.readouterr().out
+
+        # Should NOT tell users to use --s3 flag (it should just always write to S3)
+        assert '--s3' not in out
+
 
 # --- diff_segment with pk alignment -------------------------------------------
 
