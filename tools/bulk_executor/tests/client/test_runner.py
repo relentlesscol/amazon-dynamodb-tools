@@ -895,6 +895,18 @@ class TestStartGlueJob:
         kwargs = bulk_runner.glue_client.start_job_run.call_args.kwargs
         assert kwargs['WorkerType'] == runner_module.GlueJobDefaults.WorkerType.value
 
+    def test_uses_default_idle_timeout_when_missing(self, bulk_runner):
+        bulk_runner.glue_client.start_job_run.return_value = {'JobRunId': 'x'}
+        bulk_runner._start_glue_job({}, {})
+        kwargs = bulk_runner.glue_client.start_job_run.call_args.kwargs
+        assert kwargs['IdleTimeout'] == runner_module.GlueJobDefaults.IdleTimeout.value
+
+    def test_overrides_idle_timeout_with_provided_arg(self, bulk_runner):
+        bulk_runner.glue_client.start_job_run.return_value = {'JobRunId': 'x'}
+        bulk_runner._start_glue_job({}, {'XIdleTimeout': 5})
+        kwargs = bulk_runner.glue_client.start_job_run.call_args.kwargs
+        assert kwargs['IdleTimeout'] == 5
+
     def test_overrides_with_provided_args(self, bulk_runner):
         bulk_runner.glue_client.start_job_run.return_value = {'JobRunId': 'x'}
         args = {
