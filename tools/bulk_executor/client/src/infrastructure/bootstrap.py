@@ -246,6 +246,7 @@ class BootstrapInfrastructure:
                         'NumberOfWorkers': args.get('XNumberOfWorkers', GlueJobDefaults.NumberOfWorkers.value),
                         'WorkerType': args.get('XWorkerType', GlueJobDefaults.WorkerType.value),
                         'Timeout': args.get('XTimeout', GlueJobDefaults.Timeout.value), # Configuration expects minutes
+                        'IdleTimeout': args.get('XIdleTimeout', GlueJobDefaults.IdleTimeout.value),
                         'MaxRetries': args.get('XRetries', GlueJobDefaults.Retries.value),
                         'DefaultArguments': default_arguments,
                         'Connections': {'Connections': [GLUE_DYNAMODB_CONNECTION_NAME]},
@@ -269,6 +270,7 @@ class BootstrapInfrastructure:
                     NumberOfWorkers=args.get('XNumberOfWorkers', GlueJobDefaults.NumberOfWorkers.value),
                     WorkerType=args.get('XWorkerType', GlueJobDefaults.WorkerType.value),
                     Timeout=args.get('XTimeout', GlueJobDefaults.Timeout.value),
+                    IdleTimeout=args.get('XIdleTimeout', GlueJobDefaults.IdleTimeout.value),
                     MaxRetries=args.get('XRetries', GlueJobDefaults.Retries.value),
                     DefaultArguments=default_arguments,
                     Connections={'Connections': [GLUE_DYNAMODB_CONNECTION_NAME]},

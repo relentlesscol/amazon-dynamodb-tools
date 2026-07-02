@@ -293,6 +293,62 @@ class TestAddGlueJobRole:
         assert exc.value.code == 1
 
 
+# -- IdleTimeout for cost optimization (issue #88) ----------------------
+
+class TestIdleTimeoutCostOptimization:
+    """Glue job should set IdleTimeout to reduce DPU costs (issue #88).
+
+    When some Glue workers finish their tasks before others, the remaining
+    idle workers still consume DPU hours. A shorter IdleTimeout causes
+    idle workers to be reclaimed sooner, saving cost.
+    """
+
+    def test_update_path_sets_idle_timeout(self, bootstrap):
+        """When updating an existing Glue job, IdleTimeout MUST be present
+        in the JobUpdate dict sent to the Glue API, with a value shorter
+        than the AWS default of 10 minutes."""
+        with patch('infrastructure.bootstrap.is_existing_glue_job', return_value=True):
+            bootstrap._create_or_update_glue_job({})
+        job_update = bootstrap.glue_client.update_job.call_args.kwargs['JobUpdate']
+        assert 'IdleTimeout' in job_update, (
+            "IdleTimeout must be set to optimize Glue worker cost"
+        )
+        assert job_update['IdleTimeout'] < 10, (
+            "IdleTimeout should be shorter than the 10-minute default"
+        )
+
+    def test_create_path_sets_idle_timeout(self, bootstrap):
+        """When creating a new Glue job, IdleTimeout MUST be present with
+        a value shorter than the AWS default of 10 minutes."""
+        with patch('infrastructure.bootstrap.is_existing_glue_job', return_value=False):
+            bootstrap._create_or_update_glue_job({})
+        kwargs = bootstrap.glue_client.create_job.call_args.kwargs
+        assert 'IdleTimeout' in kwargs, (
+            "IdleTimeout must be set to optimize Glue worker cost"
+        )
+        assert kwargs['IdleTimeout'] < 10, (
+            "IdleTimeout should be shorter than the 10-minute default"
+        )
+
+    def test_idle_timeout_uses_default_from_constants(self, bootstrap):
+        """IdleTimeout should be sourced from GlueJobDefaults so it's
+        consistent across create/update and configurable via args."""
+        from infrastructure.constants import GlueJobDefaults
+        assert hasattr(GlueJobDefaults, 'IdleTimeout'), (
+            "GlueJobDefaults must define an IdleTimeout member"
+        )
+        # The default should be cost-effective (< 10 minutes)
+        assert GlueJobDefaults.IdleTimeout.value < 10
+
+    def test_idle_timeout_can_be_overridden_via_args(self, bootstrap):
+        """Users should be able to override IdleTimeout via --XIdleTimeout
+        like other Glue job parameters."""
+        with patch('infrastructure.bootstrap.is_existing_glue_job', return_value=True):
+            bootstrap._create_or_update_glue_job({'XIdleTimeout': 5})
+        job_update = bootstrap.glue_client.update_job.call_args.kwargs['JobUpdate']
+        assert job_update['IdleTimeout'] == 5
+
+
 # -- _create_or_update_glue_job exception path --------------------------
 
 class TestCreateOrUpdateGlueJobErrors:
