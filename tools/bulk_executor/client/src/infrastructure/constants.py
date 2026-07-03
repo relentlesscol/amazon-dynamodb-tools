@@ -1,4 +1,6 @@
+import os
 from enum import Enum
+from pathlib import Path
 
 GLUE_VERSION = '5.1'
 PYTHON_VERSION = '3'
@@ -41,10 +43,38 @@ class GlueJobDefaults(Enum):
     NumberOfWorkers=220
     WorkerType='G.1X'
 
-# Third Party Dependencies as an alpha-numeric list
-_THIRD_PARTY_PYTHON_MODULES = [
-  'faker'
-]
+# Directories that are not verbs (shared utilities, etc.)
+_NON_VERB_DIRS = {'shared', '__pycache__'}
+
+
+def discover_verb_requirements(base_path: str) -> list:
+    """Scan verb directories under base_path for requirements.txt files.
+
+    Returns a deduplicated, sorted list of pip dependency strings.
+    Skips blank lines, comments, and non-verb directories (e.g. shared).
+    """
+    deps = set()
+    base = Path(base_path)
+    if not base.is_dir():
+        return []
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name in _NON_VERB_DIRS:
+            continue
+        req_file = entry / 'requirements.txt'
+        if not req_file.exists():
+            continue
+        for line in req_file.read_text().splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                deps.add(stripped)
+    return sorted(deps)
+
+
+# Third Party Dependencies — discovered from per-verb requirements.txt files
+_PYTHON_MODULES_DIR = Path(__file__).resolve().parents[3] / 'server' / 'src' / 'python_modules'
+_THIRD_PARTY_PYTHON_MODULES = discover_verb_requirements(str(_PYTHON_MODULES_DIR))
 
 # Convert to AWS Glue Readable Format
 THIRD_PARTY_PYTHON_MODULES = ','.join(map(str, _THIRD_PARTY_PYTHON_MODULES))
