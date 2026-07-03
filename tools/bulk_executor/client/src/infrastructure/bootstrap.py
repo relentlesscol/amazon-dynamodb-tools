@@ -34,8 +34,43 @@ from .constants import (
     ROLE_TYPE_READ_ONLY,
     ROLE_TYPE_READ_WRITE,
     READ_WRITE_ROLE_TYPES,
-    THIRD_PARTY_PYTHON_MODULES,
 )
+from . import constants as _constants
+
+
+# Directories under python_modules that are not verbs (shared utilities, caches)
+_NON_VERB_DIRS = {'shared', '__pycache__'}
+
+
+def _discover_verb_requirements():
+    """Scan verb folders for requirements.txt and return a deduplicated, sorted package list.
+
+    Each verb directory under PYTHON_MODULE_CLIENT_DIR_PATH may contain a
+    requirements.txt declaring its server-side pip dependencies.  This function
+    reads all such files, deduplicates the package names, and returns them as a
+    comma-separated string suitable for --additional-python-modules.
+    """
+    modules_dir = _constants.PYTHON_MODULE_CLIENT_DIR_PATH
+    packages = set()
+
+    if not os.path.isdir(modules_dir):
+        return ''
+
+    for entry in os.listdir(modules_dir):
+        if entry in _NON_VERB_DIRS:
+            continue
+        verb_path = os.path.join(modules_dir, entry)
+        if not os.path.isdir(verb_path):
+            continue
+        req_file = os.path.join(verb_path, 'requirements.txt')
+        if os.path.isfile(req_file):
+            with open(req_file) as f:
+                for line in f:
+                    pkg = line.strip()
+                    if pkg and not pkg.startswith('#'):
+                        packages.add(pkg)
+
+    return ','.join(sorted(packages))
 
 
 class BootstrapInfrastructure:
@@ -218,7 +253,7 @@ class BootstrapInfrastructure:
             '--s3-bucket-name': glue_job_bucket,
             '--s3-script-location': s3_script_location,
             '--extra-py-files': s3_python_module_location,
-            '--additional-python-modules': THIRD_PARTY_PYTHON_MODULES,
+            '--additional-python-modules': _discover_verb_requirements(),
             '--bulk-dynamodb-version': VERSION
         })
 
