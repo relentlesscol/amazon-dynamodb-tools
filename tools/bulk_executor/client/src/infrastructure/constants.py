@@ -1,3 +1,4 @@
+import os
 from enum import Enum
 
 GLUE_VERSION = '5.1'
@@ -41,10 +42,46 @@ class GlueJobDefaults(Enum):
     NumberOfWorkers=220
     WorkerType='G.1X'
 
-# Third Party Dependencies as an alpha-numeric list
-_THIRD_PARTY_PYTHON_MODULES = [
-  'faker'
-]
+# Directories under python_modules that are not verbs (shared utilities, caches)
+_NON_VERB_DIRS = {'shared', '__pycache__'}
 
-# Convert to AWS Glue Readable Format
-THIRD_PARTY_PYTHON_MODULES = ','.join(map(str, _THIRD_PARTY_PYTHON_MODULES))
+
+def discover_verb_requirements(modules_dir=None):
+    """Scan verb folders for requirements.txt and return a deduplicated, sorted package list.
+
+    Each verb directory under modules_dir may contain a requirements.txt
+    declaring its server-side pip dependencies.  This function reads all such
+    files, deduplicates the package names, and returns them as a sorted list.
+
+    Args:
+        modules_dir: Path to the python_modules directory.  Defaults to
+            PYTHON_MODULE_CLIENT_DIR_PATH.
+    """
+    if modules_dir is None:
+        modules_dir = PYTHON_MODULE_CLIENT_DIR_PATH
+
+    packages = set()
+
+    if not os.path.isdir(modules_dir):
+        return []
+
+    for entry in os.listdir(modules_dir):
+        if entry in _NON_VERB_DIRS:
+            continue
+        verb_path = os.path.join(modules_dir, entry)
+        if not os.path.isdir(verb_path):
+            continue
+        req_file = os.path.join(verb_path, 'requirements.txt')
+        if os.path.isfile(req_file):
+            with open(req_file) as f:
+                for line in f:
+                    pkg = line.strip()
+                    if pkg and not pkg.startswith('#'):
+                        packages.add(pkg)
+
+    return sorted(packages)
+
+
+# Third-party Python modules discovered from per-verb requirements.txt files.
+# Kept as a comma-separated string for backwards compatibility with bootstrap.
+THIRD_PARTY_PYTHON_MODULES = ','.join(discover_verb_requirements())
