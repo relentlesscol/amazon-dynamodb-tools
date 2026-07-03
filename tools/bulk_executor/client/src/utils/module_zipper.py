@@ -50,3 +50,61 @@ def _zip_module(source_path, zip_path):
     except Exception as e:
         log.error(f"Error zipping {source_path}: {e}")
         return False
+
+
+def zip_commands(commands_dir, zip_path):
+    """Discover server modules from commands/*/server/ and zip them under python_modules/.
+
+    Each command folder's server/ contents are placed under python_modules/.
+    If the server/ dir contains a file or directory matching the command name
+    (e.g. commands/copy/server/copy.py), contents are merged flat.  Otherwise
+    the command name becomes a package prefix (e.g. commands/shared/server/helper.py
+    -> python_modules/shared/helper.py).
+    """
+    try:
+        commands_dir = os.path.abspath(os.path.normpath(commands_dir))
+        zip_path = os.path.abspath(os.path.normpath(zip_path))
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.writestr('python_modules/', '')
+
+            for entry in sorted(os.listdir(commands_dir)):
+                server_dir = os.path.join(commands_dir, entry, 'server')
+                if not os.path.isdir(server_dir):
+                    continue
+
+                # Determine if this command's server/ has a top-level entry
+                # matching the command name (file or directory).  If so, merge
+                # flat; otherwise namespace under the command name.
+                top_entries = os.listdir(server_dir)
+                has_canonical = (
+                    (entry + '.py') in top_entries or
+                    entry in top_entries
+                )
+                prefix = '' if has_canonical else entry + '/'
+
+                if prefix:
+                    zipf.writestr('python_modules/' + prefix, '')
+
+                for root, dirs, files in os.walk(server_dir):
+                    rel = os.path.relpath(root, server_dir)
+
+                    # Add directory entries
+                    for d in dirs:
+                        dir_rel = os.path.join(rel, d) if rel != '.' else d
+                        arcname = 'python_modules/' + prefix + dir_rel + '/'
+                        zipf.writestr(arcname, '')
+
+                    for f in files:
+                        file_path = os.path.join(root, f)
+                        if os.path.islink(file_path):
+                            continue
+                        file_rel = os.path.join(rel, f) if rel != '.' else f
+                        arcname = 'python_modules/' + prefix + file_rel
+                        zipf.write(file_path, arcname)
+
+        log.info(f"Successfully zipped commands from {commands_dir} to {zip_path}")
+        return True
+    except Exception as e:
+        log.error(f"Error zipping commands from {commands_dir}: {e}")
+        return False
