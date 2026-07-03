@@ -2,6 +2,7 @@ import base64
 import json
 import random
 import sys
+from decimal import Decimal
 
 import boto3
 from boto3 import Session
@@ -16,7 +17,7 @@ from python_modules.shared.table_info import (
 )
 
 from python_modules.shared.rate_limiter import (
-    RateLimiterAggregator,  
+    RateLimiterAggregator,
     RateLimiterSharedConfig,
     RateLimiterWorker
 )
@@ -24,10 +25,16 @@ from python_modules.shared.rate_limiter import (
 PRINT_LIMIT = 100
 
 class BinaryAwareEncoder(json.JSONEncoder):
-    """Custom JSON encoder that handles bytes objects by converting them to base64-encoded strings."""
+    """Custom JSON encoder that handles bytes, Decimal, and set objects from DynamoDB."""
     def default(self, obj):
         if isinstance(obj, bytes):
             return base64.b64encode(obj).decode('utf-8')
+        if isinstance(obj, Decimal):
+            # Use string representation to preserve precision
+            return str(obj)
+        if isinstance(obj, set):
+            # Sort for deterministic comparison
+            return sorted(str(item) for item in obj)
         return super().default(obj)
 
 class SegmentStream:
@@ -302,6 +309,7 @@ def run(job, spark_context, glue_context, parsed_args):
     use_s3 = parsed_args.get('s3')
     job_id = parsed_args.get("JOB_RUN_ID")
     bucket = parsed_args.get('s3-bucket-name')
+    output_format = parsed_args.get('output', 'text')
 
     segment_indices = list(range(splits))
     true_fraction = 1.0
@@ -309,18 +317,47 @@ def run(job, spark_context, glue_context, parsed_args):
         sample_size = max(1, int(splits * sample_fraction))
         segment_indices = sorted(random.sample(segment_indices, sample_size))
         true_fraction = sample_size / splits
-        print()
-        percent = f"{true_fraction * 100:.10f}".rstrip('0').rstrip('.') + '%' # no zeros in decimal
-        print(f"Sampling {percent} of segments ({sample_size} of {splits} total): {segment_indices}")
-        print()
+        if output_format != 'json':
+            print()
+            percent = f"{true_fraction * 100:.10f}".rstrip('0').rstrip('.') + '%' # no zeros in decimal
+            print(f"Sampling {percent} of segments ({sample_size} of {splits} total): {segment_indices}")
+            print()
 
     table1_cost = print_dynamodb_table_info(table1, fraction=true_fraction)
-    print()
     table2_cost = print_dynamodb_table_info(table2, fraction=true_fraction)
     total_cost = table1_cost + table2_cost
-    print()
-    print(f"TOTAL DynamoDB cost for scanning both tables (approx): ${total_cost:,.2f}")
-    print()
+    if output_format != 'json':
+        print()
+        print(f"TOTAL DynamoDB cost for scanning both tables (approx): ${total_cost:,.2f}")
+        print()
+
+    # Check max cost budget if specified
+    max_cost = parsed_args.get('XMaxEstimatedCostAllowed')
+    if max_cost is not None:
+        max_cost = float(max_cost)
+        print(f"Max allowed cost (budget): ${max_cost:,.2f}")
+        if total_cost > max_cost:
+            raise Exception(
+                f"Estimated cost ${total_cost:,.2f} exceeds max allowed budget "
+                f"${max_cost:,.2f}. Job halted."
+            )
+
+    # Check if timeout is sufficient for the data volume
+    timeout_minutes = parsed_args.get('XTimeout')
+    max_read_rate = parsed_args.get('XMaxReadRate')
+    if timeout_minutes is not None and max_read_rate is not None:
+        timeout_seconds = int(timeout_minutes) * 60
+        max_read_rate = int(max_read_rate)
+        # Get item count from table info
+        table_info = get_and_print_dynamodb_table_info(table1)
+        if isinstance(table_info, dict) and 'item_count' in table_info:
+            item_count = table_info['item_count']
+            estimated_seconds = item_count / max_read_rate if max_read_rate > 0 else float('inf')
+            if estimated_seconds > timeout_seconds:
+                estimated_minutes = estimated_seconds / 60
+                print(f"WARNING: Timeout insufficient — estimated scan time "
+                      f"({estimated_minutes:,.0f} min) exceeds XTimeout ({timeout_minutes} min). "
+                      f"Consider increasing --XTimeout.")
 
     schema1 = boto3.client("dynamodb").describe_table(TableName=table1)['Table']['KeySchema']
     schema2 = boto3.client("dynamodb").describe_table(TableName=table2)['Table']['KeySchema']
@@ -363,22 +400,30 @@ def run(job, spark_context, glue_context, parsed_args):
 
     if use_s3:
         total = sum(rdd2)
-        if total == 0:
+        if output_format == 'json':
+            print(json.dumps({'count': total, 'location': f"s3://{bucket}/{job_id}/"}))
+        elif total == 0:
             print("No differences found")
         else:
             print(f"There are {total} differences. These can be found in files at s3://{bucket}/{job_id}/")
     else:
-        count = 0
+        all_diffs = []
         for e in rdd2:
             for r in e:
-                if count < PRINT_LIMIT:
-                    print(r)
-                count = count + 1
+                all_diffs.append(r)
 
-        if count == 0:
-            print("No differences found")
-        elif count <= PRINT_LIMIT:
-            print(f"There are {count} differences.")
+        if output_format == 'json':
+            print(json.dumps({'count': len(all_diffs), 'differences': all_diffs}))
         else:
-            print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}. Use the --s3 flag to store them all in S3.")
+            count = len(all_diffs)
+            for i, r in enumerate(all_diffs):
+                if i < PRINT_LIMIT:
+                    print(r)
+
+            if count == 0:
+                print("No differences found")
+            elif count <= PRINT_LIMIT:
+                print(f"There are {count} differences.")
+            else:
+                print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}. Use the --s3 flag to store them all in S3.")
     print()

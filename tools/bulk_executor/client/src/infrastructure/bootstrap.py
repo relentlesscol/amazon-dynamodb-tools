@@ -183,6 +183,10 @@ class BootstrapInfrastructure:
             exit(1)
 
     def _create_or_update_glue_job(self, args, is_create_allowed=True):
+        # If user specified an existing bucket, store it for _get_glue_job_bucket_name
+        if args.get('XS3Bucket'):
+            self._user_specified_bucket = args['XS3Bucket']
+
         glue_job_bucket = self._get_glue_job_bucket_name()
 
         # Determine the role name
@@ -350,6 +354,11 @@ class BootstrapInfrastructure:
         log.info(f"Glue script '{GLUE_JOB_SERVER_ROOT_PATH}' uploaded into S3 successfully.")
 
     def _get_glue_job_bucket_name(self):
+        # If the user specified a bucket via --XS3Bucket, use it directly
+        if hasattr(self, '_user_specified_bucket') and self._user_specified_bucket:
+            log.debug(f"Using user-specified S3 Bucket: {self._user_specified_bucket}")
+            return self._user_specified_bucket
+
         # Return the existing persisted S3 Bucket name
         job_details = self._get_glue_job_details()
         if job_details:
@@ -521,6 +530,41 @@ class BootstrapInfrastructure:
         self._upload_job_root_to_s3()
         self.update_python_modules_in_s3()
         self._upload_property_files_to_s3()
+
+    def _discover_requirements(self, base_path=None):
+        """Discover per-command requirements.txt files and return merged package list.
+
+        Scans server/src/python_modules/*/requirements.txt for additional
+        Python packages needed by individual command verbs.
+
+        Args:
+            base_path: Root path containing server/src/python_modules/.
+                       Defaults to the project root (two levels up from this file).
+
+        Returns:
+            list: Deduplicated list of package names from all requirements.txt files.
+        """
+        if base_path is None:
+            base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+        modules_dir = os.path.join(base_path, 'server', 'src', 'python_modules')
+        packages = []
+        seen = set()
+
+        if not os.path.isdir(modules_dir):
+            return packages
+
+        for entry in os.listdir(modules_dir):
+            req_file = os.path.join(modules_dir, entry, 'requirements.txt')
+            if os.path.isfile(req_file):
+                with open(req_file, 'r') as f:
+                    for line in f:
+                        pkg = line.strip()
+                        if pkg and pkg not in seen:
+                            seen.add(pkg)
+                            packages.append(pkg)
+
+        return packages
 
     def _ensure_dynamodb_glue_connection(self):
         """Create a Glue connection of type DYNAMODB if missing.
