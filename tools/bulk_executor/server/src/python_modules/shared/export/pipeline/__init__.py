@@ -66,20 +66,24 @@ def _apply_transform_and_resolve(spark_context, records_rdd, export_load_type, p
 
     def _resolve_and_validate(record):
         item = parser.resolve(record)
-        if item["operation"] == Operation.PUT:
-            missing = expected_keys - item["data"].keys()
-            if missing:
-                error_accumulator.add([f"Item missing key attributes after resolve: {missing}"])
-                return None
-        elif item["operation"] == Operation.DELETE:
-            missing = expected_keys - item["data"].keys()
-            if missing:
-                error_accumulator.add([f"DELETE item missing key attributes: {missing}"])
-                return None
-            extra = item["data"].keys() - expected_keys
-            if extra:
-                error_accumulator.add([f"DELETE item has non-key attributes: {extra}"])
-                return None
+        try:
+            if item["operation"] == Operation.PUT:
+                missing = expected_keys - item["data"].keys()
+                if missing:
+                    error_accumulator.add([f"Item missing key attributes after resolve: {missing}"])
+                    return None
+            elif item["operation"] == Operation.DELETE:
+                missing = expected_keys - item["data"].keys()
+                if missing:
+                    error_accumulator.add([f"DELETE item missing key attributes: {missing}"])
+                    return None
+                extra = item["data"].keys() - expected_keys
+                if extra:
+                    error_accumulator.add([f"DELETE item has non-key attributes: {extra}"])
+                    return None
+        except (TypeError, KeyError) as e:
+            error_accumulator.add([f"Parser returned invalid item (expected dict with 'operation' and 'data'): {e}"])
+            return None
         return item
 
     items_rdd = records_rdd.map(_resolve_and_validate).filter(lambda x: x is not None)
