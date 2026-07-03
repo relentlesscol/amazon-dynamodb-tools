@@ -162,20 +162,29 @@ def run(job, spark_context, glue_context, parsed_args):
             json_df = spark.read.json(json_rdd)
             json_df.write.mode("overwrite").json(s3_output_location)
 
-            # Print the top N many
-            TOP_N = 10
-            if count <= TOP_N:
-                print(f"{count} matching items:")
+            if parsed_args.get('output') == 'json':
+                # Structured JSON output: single object with count, items, s3_location
+                items = [json.loads(r) for r in records.toJSON().collect()]
+                print(json.dumps({
+                    'count': count,
+                    'items': items,
+                    's3_location': s3_output_location,
+                }))
             else:
-                print(f"First {TOP_N} matching items:")
-            top_n_records = records.limit(TOP_N).toJSON().collect()
-            for record in top_n_records:
-                print(record)
-            if count > TOP_N:
-                print(f"...and {count - TOP_N} more not printed")
-            print()
-            print(f"Wrote {count:,} items in JSON format to {s3_output_location}/")
-            print()
+                # Print the top N many
+                TOP_N = 10
+                if count <= TOP_N:
+                    print(f"{count} matching items:")
+                else:
+                    print(f"First {TOP_N} matching items:")
+                top_n_records = records.limit(TOP_N).toJSON().collect()
+                for record in top_n_records:
+                    print(record)
+                if count > TOP_N:
+                    print(f"...and {count - TOP_N} more not printed")
+                print()
+                print(f"Wrote {count:,} items in JSON format to {s3_output_location}/")
+                print()
 
         elif DO_DELETE:
             keys = get_table_keys(DYNAMO_DB_TABLE_NAME)
