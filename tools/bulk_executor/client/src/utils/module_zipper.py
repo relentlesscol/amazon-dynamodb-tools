@@ -22,13 +22,28 @@ def _zip_module(source_path, zip_path):
         if os.path.commonpath([source_path, zip_path]) == source_path:
             raise ValueError("zip_path must not be inside source_path")
 
+        # Directories to prune from os.walk (never descend into these)
+        _EXCLUDED_DIRS = {'__pycache__'}
+        # File patterns to skip
+        _EXCLUDED_FILES = {'.DS_Store'}
+        _EXCLUDED_EXTENSIONS = {'.pyc'}
+
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             parent_dir = os.path.basename(source_path.rstrip('/\\'))
             # Add an explicit entry for the parent directory
             zipf.writestr(parent_dir + '/', '')
 
             for root, dirs, files in os.walk(source_path):
+                # Prune excluded directories in-place to prevent descent
+                dirs[:] = [d for d in dirs if d not in _EXCLUDED_DIRS]
+
                 for file in files:
+                    # Skip cruft files
+                    if file in _EXCLUDED_FILES:
+                        continue
+                    if os.path.splitext(file)[1] in _EXCLUDED_EXTENSIONS:
+                        continue
+
                     file_path = os.path.join(root, file)
 
                     # Skip any symlinked files out of an abundance of caution
