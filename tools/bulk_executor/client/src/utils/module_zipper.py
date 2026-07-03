@@ -22,13 +22,24 @@ def _zip_module(source_path, zip_path):
         if os.path.commonpath([source_path, zip_path]) == source_path:
             raise ValueError("zip_path must not be inside source_path")
 
+        # Cruft patterns to exclude from the archive
+        _EXCLUDED_DIRS = {'__pycache__'}
+        _EXCLUDED_FILES = {'.DS_Store'}
+
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             parent_dir = os.path.basename(source_path.rstrip('/\\'))
             # Add an explicit entry for the parent directory
             zipf.writestr(parent_dir + '/', '')
 
             for root, dirs, files in os.walk(source_path):
+                # Prune excluded directories in-place so os.walk skips them
+                dirs[:] = [d for d in dirs if d not in _EXCLUDED_DIRS]
+
                 for file in files:
+                    # Skip excluded file patterns
+                    if file in _EXCLUDED_FILES or file.endswith('.pyc'):
+                        continue
+
                     file_path = os.path.join(root, file)
 
                     # Skip any symlinked files out of an abundance of caution

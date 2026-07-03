@@ -43,6 +43,19 @@ TERMINAL_JOB_STATES = set([
 # Timing constants
 WAIT_TIME_SECONDS = 0.5 # Time to wait before checking job run state again (in seconds)
 
+
+def get_estimated_cost(glue_job_arguments, args):
+    """Estimate the cost of a Glue job run based on worker count and timeout.
+
+    Returns an estimated dollar amount for the job run.
+    """
+    num_workers = args.get('XNumberOfWorkers', GlueJobDefaults.NumberOfWorkers.value)
+    timeout_minutes = args.get('XTimeout', GlueJobDefaults.Timeout.value)
+    # G.1X worker costs ~$0.44/DPU-hour
+    dpu_hour_cost = 0.44
+    estimated_hours = timeout_minutes / 60.0
+    return num_workers * dpu_hour_cost * estimated_hours
+
 class BulkDynamoDbRunner:
     def __init__(self, env_configs):
         self.aws_region = env_configs.aws_region
@@ -429,6 +442,17 @@ class BulkDynamoDbRunner:
             log.error(error_message)
             log.info("Job not executed.")
             return
+
+        # Check cost limit before starting the job
+        max_cost = args.get('XMaxEstimatedCostAllowed')
+        if max_cost is not None:
+            estimated_cost = get_estimated_cost(glue_job_arguments, args)
+            if estimated_cost > max_cost:
+                print(
+                    f"Estimated cost ${estimated_cost:.2f} exceeds max allowed "
+                    f"${max_cost:.2f}. Job not started."
+                )
+                return
 
         log.info("""
 

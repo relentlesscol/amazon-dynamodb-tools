@@ -1,3 +1,4 @@
+import os
 from enum import Enum
 
 GLUE_VERSION = '5.1'
@@ -48,3 +49,39 @@ _THIRD_PARTY_PYTHON_MODULES = [
 
 # Convert to AWS Glue Readable Format
 THIRD_PARTY_PYTHON_MODULES = ','.join(map(str, _THIRD_PARTY_PYTHON_MODULES))
+
+
+def get_third_party_modules(modules_dir=None):
+    """Discover per-verb requirements.txt files and return combined module list.
+
+    Scans each subdirectory of modules_dir for a requirements.txt file,
+    reads the package names, deduplicates, and returns a comma-separated
+    string suitable for Glue's --additional-python-modules parameter.
+
+    Args:
+        modules_dir: Path to python_modules directory. Defaults to
+                     PYTHON_MODULE_CLIENT_DIR_PATH.
+
+    Returns:
+        Comma-separated string of third-party module names.
+    """
+    if modules_dir is None:
+        modules_dir = PYTHON_MODULE_CLIENT_DIR_PATH
+
+    modules = set()
+    if not os.path.isdir(modules_dir):
+        return THIRD_PARTY_PYTHON_MODULES
+
+    for entry in os.listdir(modules_dir):
+        entry_path = os.path.join(modules_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        req_file = os.path.join(entry_path, 'requirements.txt')
+        if os.path.isfile(req_file):
+            with open(req_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        modules.add(line)
+
+    return ','.join(sorted(modules)) if modules else ''

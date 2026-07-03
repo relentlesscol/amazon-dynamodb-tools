@@ -64,6 +64,7 @@ def run(job, spark_context, glue_context, parsed_args):
     WHERE = parsed_args.get('where', None)
     ORDERBY = parsed_args.get('orderby', None)
     LIMIT = parsed_args.get('limit', None)
+    OUTPUT_FORMAT = parsed_args.get('output', 'text')
 
     glue_job_action = parsed_args.get('XAction')
     DO_COUNT = glue_job_action == 'count'
@@ -101,7 +102,11 @@ def run(job, spark_context, glue_context, parsed_args):
         df = read_dynamodb_dataframe(
             glue_context, DYNAMO_DB_TABLE_NAME, parsed_args,
             splits=DYNAMO_DB_NUMBER_OF_SPLITS)
-        print(f"Count of matching items: {df.count():,}")
+        count_value = df.count()
+        if OUTPUT_FORMAT == 'json':
+            print(json.dumps({'count': count_value}))
+        else:
+            print(f"Count of matching items: {count_value:,}")
 
     # OK, we're gonna convert the DynamicFrame to a DataFrame for processing
     else:
@@ -142,7 +147,11 @@ def run(job, spark_context, glue_context, parsed_args):
             return keys
 
         if DO_COUNT:
-            print(f"Count of matching items: {records.count():,}")
+            count_value = records.count()
+            if OUTPUT_FORMAT == 'json':
+                print(json.dumps({'count': count_value}))
+            else:
+                print(f"Count of matching items: {count_value:,}")
 
         elif DO_FIND:
             records.cache()
@@ -162,20 +171,30 @@ def run(job, spark_context, glue_context, parsed_args):
             json_df = spark.read.json(json_rdd)
             json_df.write.mode("overwrite").json(s3_output_location)
 
-            # Print the top N many
-            TOP_N = 10
-            if count <= TOP_N:
-                print(f"{count} matching items:")
+            if OUTPUT_FORMAT == 'json':
+                # Structured JSON output
+                items = [json.loads(r) for r in records.limit(10).toJSON().collect()]
+                result = {
+                    'count': count,
+                    'items': items,
+                    's3_location': f"{s3_output_location}/",
+                }
+                print(json.dumps(result))
             else:
-                print(f"First {TOP_N} matching items:")
-            top_n_records = records.limit(TOP_N).toJSON().collect()
-            for record in top_n_records:
-                print(record)
-            if count > TOP_N:
-                print(f"...and {count - TOP_N} more not printed")
-            print()
-            print(f"Wrote {count:,} items in JSON format to {s3_output_location}/")
-            print()
+                # Print the top N many
+                TOP_N = 10
+                if count <= TOP_N:
+                    print(f"{count} matching items:")
+                else:
+                    print(f"First {TOP_N} matching items:")
+                top_n_records = records.limit(TOP_N).toJSON().collect()
+                for record in top_n_records:
+                    print(record)
+                if count > TOP_N:
+                    print(f"...and {count - TOP_N} more not printed")
+                print()
+                print(f"Wrote {count:,} items in JSON format to {s3_output_location}/")
+                print()
 
         elif DO_DELETE:
             keys = get_table_keys(DYNAMO_DB_TABLE_NAME)
