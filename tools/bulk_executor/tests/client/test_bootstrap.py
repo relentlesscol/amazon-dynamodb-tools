@@ -793,3 +793,106 @@ class TestBootstrapInit:
         assert instance.s3_client is clients.s3_client
         assert instance.glue_client is clients.glue_client
         assert instance.logs_client is clients.logs_client
+
+
+# -- Issue #130: Allow bootstrap to specify an existing S3 bucket ----------
+
+class TestExistingBucketSupport:
+    """When --XBucket is provided, bootstrap should use that bucket name
+    instead of generating a new one. This is the core behavioral change
+    requested in issue #130: customers who cannot grant bucket-creation
+    permissions need to pass in a pre-existing S3 bucket."""
+
+    def test_xbucket_arg_is_used_as_glue_job_bucket_name(self):
+        """When XBucket is passed in args, _get_glue_job_bucket_name should
+        return that bucket name — not generate a random one or look up a
+        persisted one from an existing Glue job."""
+        with patch('infrastructure.bootstrap.Clients') as MockClients:
+            clients = MagicMock()
+            clients.iam_client = MagicMock()
+            clients.s3_client = MagicMock()
+            clients.glue_client = MagicMock()
+            clients.logs_client = MagicMock()
+            MockClients.return_value = clients
+
+            from infrastructure.bootstrap import BootstrapInfrastructure
+            env = MagicMock(aws_region='us-east-1', aws_account_id='123456789012')
+            instance = BootstrapInfrastructure(env)
+
+        # Simulate no existing Glue job (so it would normally generate one)
+        instance._get_glue_job_details = MagicMock(return_value=None)
+
+        # Pass XBucket — the feature under test
+        instance._args = {'XBucket': 'my-preexisting-bucket'}
+        bucket_name = instance._get_glue_job_bucket_name()
+
+        assert bucket_name == 'my-preexisting-bucket', (
+            f"Expected the user-specified bucket 'my-preexisting-bucket', "
+            f"but got '{bucket_name}'. Issue #130 requires that when XBucket "
+            f"is provided, that exact bucket name is used."
+        )
+
+    def test_xbucket_arg_appears_in_glue_job_default_arguments(self):
+        """End-to-end: when XBucket is in the bootstrap args dict, the
+        resulting Glue job should have --s3-bucket-name set to that bucket."""
+        with patch('infrastructure.bootstrap.Clients') as MockClients:
+            clients = MagicMock()
+            clients.iam_client = MagicMock()
+            clients.s3_client = MagicMock()
+            clients.glue_client = MagicMock()
+            clients.logs_client = MagicMock()
+            MockClients.return_value = clients
+
+            from infrastructure.bootstrap import BootstrapInfrastructure
+            env = MagicMock(aws_region='us-west-2', aws_account_id='111222333444')
+            instance = BootstrapInfrastructure(env)
+
+        # The user provides their own bucket
+        args = {'XBucket': 'customer-owned-bucket', 'XRole': 'READ-ONLY'}
+
+        # Simulate: the bucket lookup should honor XBucket
+        # Don't stub _get_glue_job_bucket_name — we want the real method
+        instance._get_glue_job_details = MagicMock(return_value=None)
+
+        with patch('infrastructure.bootstrap.is_existing_glue_job', return_value=True):
+            instance._create_or_update_glue_job(args)
+
+        update_kwargs = instance.glue_client.update_job.call_args.kwargs['JobUpdate']
+        actual_bucket = update_kwargs['DefaultArguments']['--s3-bucket-name']
+
+        assert actual_bucket == 'customer-owned-bucket', (
+            f"Expected Glue job's --s3-bucket-name to be 'customer-owned-bucket', "
+            f"but got '{actual_bucket}'. Issue #130 requires that a user-specified "
+            f"bucket flows through to the Glue job configuration."
+        )
+
+    def test_xbucket_skips_bucket_creation_in_upload(self):
+        """When an existing bucket is specified, _upload_job_root_to_s3
+        should NOT attempt to create the bucket — it should use it directly.
+        The user is responsible for the bucket's existence."""
+        with patch('infrastructure.bootstrap.Clients') as MockClients:
+            clients = MagicMock()
+            clients.iam_client = MagicMock()
+            clients.s3_client = MagicMock()
+            clients.glue_client = MagicMock()
+            clients.logs_client = MagicMock()
+            MockClients.return_value = clients
+
+            from infrastructure.bootstrap import BootstrapInfrastructure
+            env = MagicMock(aws_region='us-east-1', aws_account_id='123456789012')
+            instance = BootstrapInfrastructure(env)
+
+        # XBucket is specified — bucket should not be created
+        instance._args = {'XBucket': 'pre-existing-bucket'}
+        instance._get_glue_job_details = MagicMock(return_value=None)
+
+        # _bucket_exists returns False, but since XBucket is specified,
+        # we expect create_bucket NOT to be called
+        instance._bucket_exists = MagicMock(return_value=False)
+
+        instance._upload_job_root_to_s3()
+
+        instance.s3_client.create_bucket.assert_not_called(), (
+            "When XBucket is provided, bootstrap should NOT create the bucket. "
+            "The user takes responsibility for bucket existence per issue #130."
+        )

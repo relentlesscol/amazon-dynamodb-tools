@@ -183,6 +183,7 @@ class BootstrapInfrastructure:
             exit(1)
 
     def _create_or_update_glue_job(self, args, is_create_allowed=True):
+        self._args = args
         glue_job_bucket = self._get_glue_job_bucket_name()
 
         # Determine the role name
@@ -295,8 +296,11 @@ class BootstrapInfrastructure:
     def _upload_job_root_to_s3(self):
         glue_job_bucket = self._get_glue_job_bucket_name()
 
-        # Check if the bucket exists
-        if not self._bucket_exists(self.s3_client, glue_job_bucket):
+        # If the user specified an existing bucket, skip creation entirely
+        args = getattr(self, '_args', None) or {}
+        if args.get('XBucket'):
+            log.info(f"Using pre-existing bucket '{glue_job_bucket}' (--XBucket specified).")
+        elif not self._bucket_exists(self.s3_client, glue_job_bucket):
             try:
                 # Create the bucket
                 bucket_config = {}
@@ -350,6 +354,13 @@ class BootstrapInfrastructure:
         log.info(f"Glue script '{GLUE_JOB_SERVER_ROOT_PATH}' uploaded into S3 successfully.")
 
     def _get_glue_job_bucket_name(self):
+        # If the user specified an existing bucket via --XBucket, use it directly
+        args = getattr(self, '_args', None) or {}
+        xbucket = args.get('XBucket')
+        if xbucket:
+            log.debug(f"Using user-specified S3 Bucket: {xbucket}")
+            return xbucket
+
         # Return the existing persisted S3 Bucket name
         job_details = self._get_glue_job_details()
         if job_details:
