@@ -477,6 +477,33 @@ def _parse_arn(arn: str) -> dict:
         "resource": resource,
     }
 
+def check_timeout_sufficiency(size_bytes, max_read_rate, timeout_minutes):
+    """Check if the configured timeout is sufficient for the estimated workload.
+
+    Prints a warning if the estimated scan time exceeds the timeout.
+
+    Args:
+        size_bytes: Total table size in bytes.
+        max_read_rate: Maximum read capacity units per second.
+        timeout_minutes: Configured job timeout in minutes.
+    """
+    # Each RCU reads 8KB (eventually consistent scan)
+    rcus_needed = math.ceil(size_bytes / 8096)
+    estimated_seconds = rcus_needed / max_read_rate
+    estimated_minutes = estimated_seconds / 60
+
+    if estimated_minutes > timeout_minutes:
+        if estimated_minutes >= 60:
+            time_str = f"{estimated_minutes / 60:.1f} hours"
+        else:
+            time_str = f"{estimated_minutes:.0f} minutes"
+        print(
+            f"WARNING: Estimated scan time ({time_str}) exceeds "
+            f"configured timeout ({timeout_minutes} minutes). "
+            f"The job may not complete. Consider increasing XTimeout or XMaxReadRate."
+        )
+
+
 def _region_from_table_ref(table_ref: str) -> str | None:
     if not table_ref or not table_ref.startswith("arn:"):
         return None

@@ -74,6 +74,19 @@ def run(job, spark_context, glue_context, parsed_args):
     print_pricing_generator = print_dynamodb_table_info(DYNAMO_DB_TABLE_NAME, DO_DELETE)
     table_desc = next(print_pricing_generator)
 
+    # Check XMaxEstimatedCostAllowed — abort if estimated cost exceeds budget
+    max_cost_str = parsed_args.get('XMaxEstimatedCostAllowed')
+    if max_cost_str is not None:
+        max_cost = float(max_cost_str)
+        table_info = get_and_print_dynamodb_table_info(DYNAMO_DB_TABLE_NAME, quiet=True)
+        estimated_cost = get_and_print_table_scan_cost(table_info, table_info['region_name'])
+        if estimated_cost > max_cost:
+            raise SystemExit(
+                f"Cost abort: estimated cost ${estimated_cost:,.2f} exceeds "
+                f"max allowed ${max_cost:,.2f}. Halting execution."
+            )
+        print(f"Cost check passed: estimated ${estimated_cost:,.2f} is within budget of ${max_cost:,.2f}. Proceeding.")
+
     # We want to convert a string like "foo asc, bar desc" into an object array [asc(foo), desc(bar)]
     def parse_sort_order(sort_order_str):
         sort_order_list = []
@@ -96,12 +109,18 @@ def run(job, spark_context, glue_context, parsed_args):
     if ORDERBY:
         ORDERBY = parse_sort_order(ORDERBY)
 
+    output_format = parsed_args.get('output')
+
     # Shortcut: simple full-table count reads once and counts directly
     if DO_COUNT and not (WHERE or ORDERBY or LIMIT):
         df = read_dynamodb_dataframe(
             glue_context, DYNAMO_DB_TABLE_NAME, parsed_args,
             splits=DYNAMO_DB_NUMBER_OF_SPLITS)
-        print(f"Count of matching items: {df.count():,}")
+        count_val = df.count()
+        if output_format == 'json':
+            print(json.dumps({'count': count_val}))
+        else:
+            print(f"Count of matching items: {count_val:,}")
 
     # OK, we're gonna convert the DynamicFrame to a DataFrame for processing
     else:
@@ -142,7 +161,11 @@ def run(job, spark_context, glue_context, parsed_args):
             return keys
 
         if DO_COUNT:
-            print(f"Count of matching items: {records.count():,}")
+            count_val = records.count()
+            if output_format == 'json':
+                print(json.dumps({'count': count_val}))
+            else:
+                print(f"Count of matching items: {count_val:,}")
 
         elif DO_FIND:
             records.cache()
@@ -162,20 +185,23 @@ def run(job, spark_context, glue_context, parsed_args):
             json_df = spark.read.json(json_rdd)
             json_df.write.mode("overwrite").json(s3_output_location)
 
-            # Print the top N many
-            TOP_N = 10
-            if count <= TOP_N:
-                print(f"{count} matching items:")
+            if output_format == 'json':
+                print(json.dumps({'count': count, 's3_location': s3_output_location + '/'}))
             else:
-                print(f"First {TOP_N} matching items:")
-            top_n_records = records.limit(TOP_N).toJSON().collect()
-            for record in top_n_records:
-                print(record)
-            if count > TOP_N:
-                print(f"...and {count - TOP_N} more not printed")
-            print()
-            print(f"Wrote {count:,} items in JSON format to {s3_output_location}/")
-            print()
+                # Print the top N many
+                TOP_N = 10
+                if count <= TOP_N:
+                    print(f"{count} matching items:")
+                else:
+                    print(f"First {TOP_N} matching items:")
+                top_n_records = records.limit(TOP_N).toJSON().collect()
+                for record in top_n_records:
+                    print(record)
+                if count > TOP_N:
+                    print(f"...and {count - TOP_N} more not printed")
+                print()
+                print(f"Wrote {count:,} items in JSON format to {s3_output_location}/")
+                print()
 
         elif DO_DELETE:
             keys = get_table_keys(DYNAMO_DB_TABLE_NAME)

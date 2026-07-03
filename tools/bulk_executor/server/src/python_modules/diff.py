@@ -2,6 +2,7 @@ import base64
 import json
 import random
 import sys
+from decimal import Decimal
 
 import boto3
 from boto3 import Session
@@ -16,7 +17,7 @@ from python_modules.shared.table_info import (
 )
 
 from python_modules.shared.rate_limiter import (
-    RateLimiterAggregator,  
+    RateLimiterAggregator,
     RateLimiterSharedConfig,
     RateLimiterWorker
 )
@@ -24,10 +25,14 @@ from python_modules.shared.rate_limiter import (
 PRINT_LIMIT = 100
 
 class BinaryAwareEncoder(json.JSONEncoder):
-    """Custom JSON encoder that handles bytes objects by converting them to base64-encoded strings."""
+    """Custom JSON encoder that handles bytes, Decimal, and set objects."""
     def default(self, obj):
         if isinstance(obj, bytes):
             return base64.b64encode(obj).decode('utf-8')
+        if isinstance(obj, Decimal):
+            return str(obj)
+        if isinstance(obj, (set, frozenset)):
+            return sorted(str(x) for x in obj)
         return super().default(obj)
 
 class SegmentStream:
