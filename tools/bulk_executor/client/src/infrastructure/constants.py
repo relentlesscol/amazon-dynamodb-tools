@@ -1,4 +1,5 @@
 from enum import Enum
+from pathlib import Path
 
 GLUE_VERSION = '5.1'
 PYTHON_VERSION = '3'
@@ -41,10 +42,28 @@ class GlueJobDefaults(Enum):
     NumberOfWorkers=220
     WorkerType='G.1X'
 
-# Third Party Dependencies as an alpha-numeric list
-_THIRD_PARTY_PYTHON_MODULES = [
-  'faker'
-]
+# Discover third-party packages from verb-specific requirements.txt files
+def discover_verb_requirements():
+    """Scan server/src/python_modules/*/requirements.txt and return aggregated package list."""
+    # Resolve relative to this file's location (client/src/infrastructure/)
+    # Navigate up to the project root, then into server/src/python_modules/
+    project_root = Path(__file__).resolve().parents[2].parent
+    modules_dir = project_root / 'server' / 'src' / 'python_modules'
 
-# Convert to AWS Glue Readable Format
-THIRD_PARTY_PYTHON_MODULES = ','.join(map(str, _THIRD_PARTY_PYTHON_MODULES))
+    packages = []
+    if modules_dir.is_dir():
+        for req_file in sorted(modules_dir.glob('*/requirements.txt')):
+            for line in req_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    packages.append(line)
+    return packages
+
+
+# Third Party Dependencies — no longer hardcoded; discovered from verb requirements.txt
+_THIRD_PARTY_PYTHON_MODULES = []
+
+# Convert to AWS Glue Readable Format (includes both static and discovered packages)
+THIRD_PARTY_PYTHON_MODULES = ','.join(
+    map(str, _THIRD_PARTY_PYTHON_MODULES + discover_verb_requirements())
+)

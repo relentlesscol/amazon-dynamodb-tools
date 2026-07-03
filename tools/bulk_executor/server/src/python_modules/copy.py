@@ -48,7 +48,24 @@ def run(job, spark_context, glue_context, parsed_args):
     bucket_name = parsed_args.get('s3-bucket-name')
     job_run_id = parsed_args.get("JOB_RUN_ID")
 
-    print_dynamodb_table_info(source_table, target_table)
+    # Cost estimation (also prints info)
+    source_table_info = get_and_print_dynamodb_table_info(source_table)
+    scan_cost = get_and_print_table_scan_cost(source_table_info)
+    target_table_info = get_and_print_dynamodb_table_info(target_table)
+    write_cost = get_and_print_table_copy_write_cost(source_table_info, target_table_info)
+    total_cost = scan_cost + write_cost
+    print(f"TOTAL DynamoDB cost for scanning '{source_table}' and writing to '{target_table}' (approx): ${total_cost:,.2f}")
+    print()
+
+    # Max cost guard: halt if estimated cost exceeds threshold
+    max_cost_str = parsed_args.get('XMaxEstimatedCostAllowed')
+    if max_cost_str is not None:
+        max_cost = float(max_cost_str)
+        if total_cost > max_cost:
+            raise Exception(
+                f"Estimated cost ${total_cost:,.2f} exceeds budget of "
+                f"${max_cost:,.2f}. Halting to avoid overspend."
+            )
 
     source_rate_limiter_shared_config = RateLimiterSharedConfig(
         bucket=bucket_name,
