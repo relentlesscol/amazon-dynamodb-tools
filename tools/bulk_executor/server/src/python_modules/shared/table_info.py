@@ -11,6 +11,24 @@ from .pricing import PricingUtility
 MIN_RECOMMENDED_READ_RATE = 100
 MIN_RECOMMENDED_WRITE_RATE = 100
 
+
+def check_timeout_sufficiency(item_count, read_rate, timeout_minutes):
+    """Warn when the configured timeout is insufficient for the item count.
+
+    Computes estimated job duration from (item_count / read_rate) and compares
+    it to the configured timeout.  Emits a warning if the job cannot complete
+    in time so the user can abort or reconfigure.
+    """
+    estimated_seconds = item_count / read_rate
+    timeout_seconds = timeout_minutes * 60
+
+    if estimated_seconds > timeout_seconds:
+        estimated_minutes = int(estimated_seconds / 60)
+        log.warn(
+            f"Configured timeout of {timeout_minutes} minutes is insufficient — "
+            f"estimated job duration is {estimated_minutes} minutes"
+        )
+
 def get_quota_value(quota_name, region_name):
     """
     Get the value of a specific DynamoDB quota from Service Quotas API.
