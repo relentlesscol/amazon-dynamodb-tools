@@ -3,8 +3,9 @@
 Covers `python_modules/find.py`:
 - print_dynamodb_table_info: generator that prints table info, optionally
   computes delete costs (PROVISIONED vs PAY_PER_REQUEST billing modes)
-- run(): argument wiring, connection options, simple count (direct on
-  dynamic frame), DataFrame conversion path with WHERE/ORDERBY/LIMIT,
+- run(): argument wiring, read_dynamodb_dataframe wrapper call,
+  simple count (direct DataFrame count), DataFrame processing path
+  with WHERE/ORDERBY/LIMIT,
   parse_sort_order (inner fn): asc/desc/default/multi-column/empty-spec,
   DO_FIND branch (S3 write, top-N printing, count <= TOP_N vs > TOP_N),
   DO_DELETE branch (repartitioning, delete_partition inner fn, error
@@ -12,6 +13,8 @@ Covers `python_modules/find.py`:
 
 The existing tests/server/conftest.py mocks awsglue, pyspark, and
 shared modules at all resolution paths. These tests build on that.
+The conftest provides a _ReadDataFrameStub for glue_connector.read_dynamodb_dataframe
+that returns a chainable DataFrame mock and records calls.
 """
 
 import json
@@ -82,23 +85,28 @@ def boto3_session_mock(monkeypatch):
 
 
 @pytest.fixture
-def glue_context():
-    """Mock GlueContext with a dynamic frame that supports count() and toDF()."""
-    ctx = MagicMock()
-    dynamic_frame = MagicMock()
-    dynamic_frame.count = MagicMock(return_value=42)
+def read_df(monkeypatch):
+    """Provide a controlled DataFrame mock returned by read_dynamodb_dataframe.
+
+    The conftest installs a _ReadDataFrameStub on find_module.read_dynamodb_dataframe.
+    This fixture replaces it with a fresh MagicMock that returns a chainable df,
+    giving each test full control over return values.
+
+    Returns (read_mock, df) where:
+    - read_mock: the mock replacing read_dynamodb_dataframe (inspect .call_args)
+    - df: the DataFrame mock that run() will operate on
+    """
     df = MagicMock()
-    df.filter = MagicMock(return_value=df)
-    df.orderBy = MagicMock(return_value=df)
-    df.limit = MagicMock(return_value=df)
-    df.count = MagicMock(return_value=5)
-    df.cache = MagicMock(return_value=df)
-    df.toJSON = MagicMock(return_value=MagicMock())
-    df.select = MagicMock(return_value=df)
-    df.repartition = MagicMock(return_value=df)
-    dynamic_frame.toDF = MagicMock(return_value=df)
-    ctx.create_dynamic_frame.from_options = MagicMock(return_value=dynamic_frame)
-    return ctx
+    df.count.return_value = 0
+    for method in ('cache', 'filter', 'orderBy', 'limit', 'select', 'repartition'):
+        getattr(df, method).return_value = df
+    df.toJSON.return_value = MagicMock()
+    df.toJSON.return_value.collect.return_value = []
+    df.toJSON.return_value.foreachPartition = MagicMock()
+
+    read_mock = MagicMock(return_value=df)
+    monkeypatch.setattr(find_module, 'read_dynamodb_dataframe', read_mock)
+    return read_mock, df
 
 
 @pytest.fixture
@@ -118,14 +126,13 @@ def base_args():
 
 # --- print_dynamodb_table_info -----------------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Tracked in followup: rewrite to assert against wrapper boundary.")
 class TestPrintDynamodbTableInfo:
     """Generator that prints table info and optionally computes delete costs."""
 
     def test_non_delete_yields_table_info_and_completes(
         self, table_info_mocks, boto3_session_mock
     ):
-        """Lines 28-31, 57: non-delete path calls info/cost helpers then yields."""
+        """Non-delete path calls info/cost helpers then yields."""
         gen = find_module.print_dynamodb_table_info('my-table', False)
         result = next(gen)
 
@@ -136,10 +143,9 @@ class TestPrintDynamodbTableInfo:
     def test_non_delete_second_next_returns_stop_iteration(
         self, table_info_mocks, boto3_session_mock
     ):
-        """Line 57: final yield prevents StopIteration on second next()."""
+        """Final yield prevents StopIteration on second next()."""
         gen = find_module.print_dynamodb_table_info('t', False)
         next(gen)
-        # Second next should hit the final yield (line 57), not StopIteration
         try:
             next(gen)
         except StopIteration:
@@ -148,7 +154,7 @@ class TestPrintDynamodbTableInfo:
     def test_kwargs_passed_through_to_scan_cost(
         self, table_info_mocks, boto3_session_mock
     ):
-        """Line 31: kwargs forwarded to get_and_print_table_scan_cost."""
+        """kwargs forwarded to get_and_print_table_scan_cost."""
         gen = find_module.print_dynamodb_table_info('t', False, fraction=0.5)
         next(gen)
 
@@ -159,7 +165,7 @@ class TestPrintDynamodbTableInfo:
     def test_delete_provisioned_prints_provisioned_cost(
         self, table_info_mocks, boto3_session_mock, pricing_mock, capsys
     ):
-        """Lines 34-56: is_delete=True with PROVISIONED billing prints provisioned cost."""
+        """is_delete=True with PROVISIONED billing prints provisioned cost."""
         table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
             'item_count': 1000,
             'size_bytes': 50000,
@@ -178,7 +184,7 @@ class TestPrintDynamodbTableInfo:
     def test_delete_pay_per_request_prints_ondemand_cost(
         self, table_info_mocks, boto3_session_mock, pricing_mock, capsys
     ):
-        """Lines 34-56: is_delete=True with PAY_PER_REQUEST prints on-demand cost."""
+        """is_delete=True with PAY_PER_REQUEST prints on-demand cost."""
         table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
             'item_count': 1000,
             'size_bytes': 50000,
@@ -196,7 +202,7 @@ class TestPrintDynamodbTableInfo:
     def test_delete_cost_math(
         self, table_info_mocks, boto3_session_mock, pricing_mock, capsys
     ):
-        """Lines 38-44: avg_size, write_units, cost computation."""
+        """avg_size, write_units, cost computation."""
         table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
             'item_count': 99,  # +1 in denominator = 100
             'size_bytes': 10000,  # avg_size = ceil(10000/100) = 100
@@ -215,7 +221,7 @@ class TestPrintDynamodbTableInfo:
     def test_delete_avoids_division_by_zero(
         self, table_info_mocks, boto3_session_mock, pricing_mock, capsys
     ):
-        """Line 38: item_count=0 uses +1 to avoid division by zero."""
+        """item_count=0 uses +1 to avoid division by zero."""
         table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
             'item_count': 0,
             'size_bytes': 1024,
@@ -230,7 +236,7 @@ class TestPrintDynamodbTableInfo:
     def test_delete_unknown_billing_mode_prints_neither_cost_line(
         self, table_info_mocks, boto3_session_mock, pricing_mock, capsys
     ):
-        """Lines 52-55: billing_mode not PROVISIONED or PAY_PER_REQUEST skips both cost prints."""
+        """billing_mode not PROVISIONED or PAY_PER_REQUEST skips both cost prints."""
         table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
             'item_count': 100,
             'size_bytes': 5000,
@@ -249,220 +255,129 @@ class TestPrintDynamodbTableInfo:
 
 # --- run(): Simple count (no DataFrame conversion) ----------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestRunSimpleCount:
-    """The fast path: DO_COUNT with no WHERE/ORDERBY/LIMIT uses dynamic frame
-    count directly, avoiding DataFrame conversion."""
+    """The fast path: DO_COUNT with no WHERE/ORDERBY/LIMIT calls
+    read_dynamodb_dataframe and prints df.count() directly."""
 
-    def test_simple_count_prints_dynamic_frame_count(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+    def test_simple_count_calls_wrapper_and_prints_count(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 118-119: simple count path."""
+        """Simple count path calls read_dynamodb_dataframe and prints result."""
+        read_mock, df = read_df
+        df.count.return_value = 42
+
         args = {
             'splits': '200', 'table': 'my-table',
             'where': None, 'orderby': None, 'limit': None,
             'XAction': 'count',
         }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
         out = capsys.readouterr().out
-        assert '42' in out, "dynamic frame count (42) printed directly"
+        assert '42' in out, "DataFrame count (42) printed directly"
 
-    def test_simple_count_does_not_set_numberOfScans(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+    def test_simple_count_passes_table_and_splits_to_wrapper(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 74: simple count skips numberOfScans=2 kwarg."""
+        """read_dynamodb_dataframe called with table name and splits."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
         args = {
             'splits': '200', 'table': 'my-table',
             'where': None, 'orderby': None, 'limit': None,
             'XAction': 'count',
         }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
-        scan_cost_call = table_info_mocks.get_and_print_table_scan_cost.call_args
-        # Should NOT have numberOfScans in kwargs
-        if scan_cost_call.kwargs:
-            assert 'numberOfScans' not in scan_cost_call.kwargs
+        read_mock.assert_called_once()
+        _, kwargs = read_mock.call_args
+        assert kwargs.get('splits') == '200' or read_mock.call_args[0][2] == args
 
-    def test_count_with_where_uses_dataframe(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+    def test_count_with_where_uses_filter(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 74, 122-158: count + WHERE forces DataFrame path."""
+        """count + WHERE filters the DataFrame from read_dynamodb_dataframe."""
+        read_mock, df = read_df
+        df.count.return_value = 7
+
         args = {
             'splits': '200', 'table': 'my-table',
             'where': 'attr > 5', 'orderby': None, 'limit': None,
             'XAction': 'count',
         }
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 7
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
         out = capsys.readouterr().out
         assert '7' in out, "DataFrame count used when WHERE present"
         df.filter.assert_called_once_with('attr > 5')
 
-    def test_count_with_where_does_not_set_numberOfScans(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+    def test_count_with_where_still_calls_wrapper(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """DataFrame connector reads once; no double-scan pricing multiplier."""
+        """count + WHERE still goes through read_dynamodb_dataframe wrapper."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
         args = {
             'splits': '200', 'table': 'my-table',
             'where': 'x = 1', 'orderby': None, 'limit': None,
             'XAction': 'count',
         }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        scan_cost_call = table_info_mocks.get_and_print_table_scan_cost.call_args
-        assert 'numberOfScans' not in (scan_cost_call.kwargs or {})
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+        read_mock.assert_called_once()
 
 
-# --- run(): Connection options ------------------------------------------------
+# --- run(): Wrapper call arguments --------------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
-class TestRunConnectionOptions:
-    """Connection options wired from parsed_args into glue_context."""
+class TestRunWrapperArgs:
+    """Verify find.run() passes correct arguments to read_dynamodb_dataframe."""
 
-    def test_connection_options_include_table_and_splits(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+    def test_wrapper_receives_glue_context_table_and_splits(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Lines 103-108: table name and splits in connection options."""
+        """read_dynamodb_dataframe called with (glue_context, table, parsed_args, splits=)."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
+        glue_ctx = MagicMock()
         args = {
             'splits': '150', 'table': 'conn-table',
             'where': None, 'orderby': None, 'limit': None,
             'XAction': 'count',
         }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), glue_ctx, args)
 
-        from_options_call = glue_context.create_dynamic_frame.from_options.call_args
-        conn_opts = from_options_call.kwargs['connection_options']
-        assert conn_opts['dynamodb.input.tableName'] == 'conn-table'
-        assert conn_opts['dynamodb.splits'] == '150'
-        assert conn_opts['dynamodb.consistentRead'] == 'false'
+        read_mock.assert_called_once_with(
+            glue_ctx, 'conn-table', args, splits='150'
+        )
 
-    def test_throughput_configs_merged_into_connection_options(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+    def test_wrapper_receives_parsed_args_for_rate_config(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 107: get_dynamodb_throughput_configs result merged into opts."""
-        table_info_mocks.get_dynamodb_throughput_configs.return_value = {'custom_key': 'custom_val'}
+        """parsed_args passed to wrapper so it can read XMaxReadRate etc."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
         args = {
             'splits': '200', 'table': 't',
             'where': None, 'orderby': None, 'limit': None,
             'XAction': 'count',
+            'XMaxReadRate': 5000,
         }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
-        from_options_call = glue_context.create_dynamic_frame.from_options.call_args
-        conn_opts = from_options_call.kwargs['connection_options']
-        assert conn_opts['custom_key'] == 'custom_val'
+        call_args = read_mock.call_args
+        assert call_args[0][2] is args
 
-    def test_throughput_configs_called_with_read_mode(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+    def test_throughput_configs_called_with_read_mode_for_delete(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 107: modes=['read'] passed to get_dynamodb_throughput_configs."""
-        args = {
-            'splits': '200', 'table': 'read-table',
-            'where': None, 'orderby': None, 'limit': None,
-            'XAction': 'count',
-        }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        """get_dynamodb_throughput_configs still called for write mode in delete path."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+        df.toJSON.return_value.foreachPartition = MagicMock()
 
-        call_args = table_info_mocks.get_dynamodb_throughput_configs.call_args
-        assert call_args.args[1] == 'read-table' or \
-            call_args.kwargs.get('modes') == ['read'] or \
-            ['read'] in call_args.args
-
-
-# --- run(): parse_sort_order (inner function) ---------------------------------
-
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
-class TestParseSortOrder:
-    """The inner parse_sort_order converts 'col asc, col2 desc' into pyspark
-    sort directives. Tested via run() since it's not module-level."""
-
-    def test_single_column_asc(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Line 90: explicit 'asc' calls pyspark asc()."""
-        args = {
-            'splits': '200', 'table': 't',
-            'where': None, 'orderby': 'name asc', 'limit': None,
-            'XAction': 'count',
-        }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.orderBy.assert_called_once()
-        # The orderBy arg is the list from parse_sort_order
-        sort_list = df.orderBy.call_args.args[0]
-        assert len(sort_list) == 1
-
-    def test_single_column_desc(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Line 92: explicit 'desc' calls pyspark desc()."""
-        args = {
-            'splits': '200', 'table': 't',
-            'where': None, 'orderby': 'age desc', 'limit': None,
-            'XAction': 'count',
-        }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.orderBy.assert_called_once()
-
-    def test_default_sort_is_asc(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Line 89: no direction specified defaults to 'asc'."""
-        args = {
-            'splits': '200', 'table': 't',
-            'where': None, 'orderby': 'score', 'limit': None,
-            'XAction': 'count',
-        }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.orderBy.assert_called_once()
-
-    def test_multiple_columns(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Lines 85-86: comma-separated specs produce multiple sort directives."""
-        args = {
-            'splits': '200', 'table': 't',
-            'where': None, 'orderby': 'a asc, b desc, c', 'limit': None,
-            'XAction': 'count',
-        }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        sort_list = df.orderBy.call_args.args[0]
-        assert len(sort_list) == 3, "three sort specs parsed"
-
-    def test_empty_spec_in_orderby_raises_value_error(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Line 97: empty spec (e.g. trailing comma) fails regex → ValueError."""
-        args = {
-            'splits': '200', 'table': 't',
-            'where': None, 'orderby': 'col asc,', 'limit': None,
-            'XAction': 'count',
-        }
-        with pytest.raises(ValueError, match="Invalid sort specification"):
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-    def test_orderby_sets_needsRepartitioning(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Line 137: orderBy sets needsRepartitioning=True (observable in delete path)."""
-        args = {
-            'splits': '200', 'table': 't',
-            'where': None, 'orderby': 'x asc', 'limit': None,
-            'XAction': 'delete',
-            's3-bucket-name': 'b', 'JOB_RUN_ID': 'j',
-        }
         monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
         monkeypatch.setattr(find_module, 'RateLimiterAggregator', MagicMock())
-        monkeypatch.setattr(find_module, 'RateLimiterWorker', MagicMock())
 
         client_mock = MagicMock()
         client_mock.describe_table.return_value = {
@@ -482,28 +397,159 @@ class TestParseSortOrder:
             'write_pricing_category': 'WriteRequestUnits',
         }
 
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        args = {
+            'splits': '200', 'table': 'read-table',
+            'where': None, 'orderby': None, 'limit': None,
+            'XAction': 'delete',
+            's3-bucket-name': 'b', 'JOB_RUN_ID': 'j',
+        }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        calls = table_info_mocks.get_dynamodb_throughput_configs.call_args_list
+        assert len(calls) >= 1
+        last_call = calls[-1]
+        assert last_call.kwargs.get('modes') == ['write']
+
+
+# --- run(): parse_sort_order (inner function) ---------------------------------
+
+class TestParseSortOrder:
+    """The inner parse_sort_order converts 'col asc, col2 desc' into pyspark
+    sort directives. Tested via run() since it's not module-level."""
+
+    def test_single_column_asc(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """Explicit 'asc' calls pyspark asc()."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
+        args = {
+            'splits': '200', 'table': 't',
+            'where': None, 'orderby': 'name asc', 'limit': None,
+            'XAction': 'count',
+        }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        df.orderBy.assert_called_once()
+        sort_list = df.orderBy.call_args.args[0]
+        assert len(sort_list) == 1
+
+    def test_single_column_desc(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """Explicit 'desc' calls pyspark desc()."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
+        args = {
+            'splits': '200', 'table': 't',
+            'where': None, 'orderby': 'age desc', 'limit': None,
+            'XAction': 'count',
+        }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        df.orderBy.assert_called_once()
+
+    def test_default_sort_is_asc(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """No direction specified defaults to 'asc'."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
+        args = {
+            'splits': '200', 'table': 't',
+            'where': None, 'orderby': 'score', 'limit': None,
+            'XAction': 'count',
+        }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        df.orderBy.assert_called_once()
+
+    def test_multiple_columns(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """Comma-separated specs produce multiple sort directives."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
+        args = {
+            'splits': '200', 'table': 't',
+            'where': None, 'orderby': 'a asc, b desc, c', 'limit': None,
+            'XAction': 'count',
+        }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        sort_list = df.orderBy.call_args.args[0]
+        assert len(sort_list) == 3, "three sort specs parsed"
+
+    def test_empty_spec_in_orderby_raises_value_error(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """Empty spec (e.g. trailing comma) fails regex -> ValueError."""
+        read_mock, df = read_df
+
+        args = {
+            'splits': '200', 'table': 't',
+            'where': None, 'orderby': 'col asc,', 'limit': None,
+            'XAction': 'count',
+        }
+        with pytest.raises(ValueError, match="Invalid sort specification"):
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+    def test_orderby_sets_needsRepartitioning(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """orderBy sets needsRepartitioning=True (observable in delete via repartition call)."""
+        read_mock, df = read_df
         df.count.return_value = 3
         df.toJSON.return_value.foreachPartition = MagicMock()
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
+        monkeypatch.setattr(find_module, 'RateLimiterAggregator', MagicMock())
 
-        df.select.assert_called(), "repartitioning selects keys"
+        client_mock = MagicMock()
+        client_mock.describe_table.return_value = {
+            'Table': {'KeySchema': [{'AttributeName': 'pk', 'KeyType': 'HASH'}]}
+        }
+        monkeypatch.setattr(find_module, 'boto3', MagicMock(
+            Session=MagicMock(return_value=MagicMock(region_name='us-east-1')),
+            client=MagicMock(return_value=client_mock)
+        ))
+
+        pricing_instance = MagicMock()
+        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
+        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
+        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
+            'item_count': 100, 'size_bytes': 5000,
+            'billing_mode': 'PAY_PER_REQUEST',
+            'write_pricing_category': 'WriteRequestUnits',
+        }
+
+        args = {
+            'splits': '200', 'table': 't',
+            'where': None, 'orderby': 'x asc', 'limit': None,
+            'XAction': 'delete',
+            's3-bucket-name': 'b', 'JOB_RUN_ID': 'j',
+        }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        df.select.assert_called()
         df.repartition.assert_called_with(200)
 
 
 # --- run(): Error paths -------------------------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestRunErrorPaths:
     """WHERE, ORDERBY, LIMIT each wrap exceptions with get_error_message."""
 
     def test_invalid_where_raises_with_message(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Lines 131-134: filter exception wrapped in 'Invalid where'."""
+        """Filter exception wrapped in 'Invalid where'."""
         monkeypatch.setattr(find_module, 'get_error_message', lambda e: f"msg:{e}")
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        _, df = read_df
         df.filter.side_effect = RuntimeError('bad filter')
 
         args = {
@@ -512,14 +558,14 @@ class TestRunErrorPaths:
             'XAction': 'count',
         }
         with pytest.raises(Exception, match="Invalid 'where'"):
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
     def test_invalid_orderby_raises_with_message(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Lines 136-140: orderBy exception wrapped in 'Invalid orderby'."""
+        """orderBy exception wrapped in 'Invalid orderby'."""
         monkeypatch.setattr(find_module, 'get_error_message', lambda e: f"msg:{e}")
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        _, df = read_df
         df.orderBy.side_effect = RuntimeError('bad order')
 
         args = {
@@ -528,12 +574,12 @@ class TestRunErrorPaths:
             'XAction': 'count',
         }
         with pytest.raises(Exception, match="Invalid 'orderby'"):
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
     def test_invalid_limit_raises_with_message(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Lines 141-148: non-integer limit wrapped in 'Invalid limit'."""
+        """Non-integer limit wrapped in 'Invalid limit'."""
         monkeypatch.setattr(find_module, 'get_error_message', lambda e: f"msg:{e}")
 
         args = {
@@ -542,54 +588,93 @@ class TestRunErrorPaths:
             'XAction': 'count',
         }
         with pytest.raises(Exception, match="Invalid 'limit'"):
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
     def test_unknown_action_raises_value_error(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 256: else branch raises ValueError for unknown action."""
+        """else branch raises ValueError for unknown action."""
+        _, df = read_df
+
         args = {
             'splits': '200', 'table': 't',
             'where': 'x = 1', 'orderby': None, 'limit': None,
             'XAction': 'unknown',
         }
         with pytest.raises(ValueError, match="Logic error"):
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
 
 # --- run(): LIMIT behavior ----------------------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestRunLimit:
     """LIMIT converts to int and optionally sets needsRepartitioning."""
 
     def test_limit_applied_to_dataframe(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Line 143: int(LIMIT) passed to records.limit()."""
+        """int(LIMIT) passed to records.limit()."""
+        _, df = read_df
+        df.count.return_value = 0
+
         args = {
             'splits': '200', 'table': 't',
             'where': None, 'orderby': None, 'limit': '50',
             'XAction': 'count',
         }
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         df.limit.assert_called_once_with(50)
 
     def test_limit_over_1000_sets_repartitioning(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 145: limit > 1000 sets needsRepartitioning (observable in delete)."""
+        """limit > 1000 sets needsRepartitioning (observable in delete via repartition)."""
+        _, df = read_df
+        df.count.return_value = 3
+        df.toJSON.return_value.foreachPartition = MagicMock()
+
+        monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
+        monkeypatch.setattr(find_module, 'RateLimiterAggregator', MagicMock())
+
+        client_mock = MagicMock()
+        client_mock.describe_table.return_value = {
+            'Table': {'KeySchema': [{'AttributeName': 'pk', 'KeyType': 'HASH'}]}
+        }
+        monkeypatch.setattr(find_module, 'boto3', MagicMock(
+            Session=MagicMock(return_value=MagicMock(region_name='us-east-1')),
+            client=MagicMock(return_value=client_mock)
+        ))
+
+        pricing_instance = MagicMock()
+        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
+        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
+        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
+            'item_count': 100, 'size_bytes': 5000,
+            'billing_mode': 'PAY_PER_REQUEST',
+            'write_pricing_category': 'WriteRequestUnits',
+        }
+
         args = {
             'splits': '200', 'table': 't',
             'where': None, 'orderby': None, 'limit': '2000',
             'XAction': 'delete',
             's3-bucket-name': 'b', 'JOB_RUN_ID': 'j',
         }
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
+
+        df.repartition.assert_called_with(200)
+
+    def test_limit_under_1000_no_repartitioning(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
+    ):
+        """limit <= 1000 does NOT set needsRepartitioning."""
+        _, df = read_df
+        df.count.return_value = 3
+        df.toJSON.return_value.foreachPartition = MagicMock()
+
         monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
         monkeypatch.setattr(find_module, 'RateLimiterAggregator', MagicMock())
-        monkeypatch.setattr(find_module, 'RateLimiterWorker', MagicMock())
 
         client_mock = MagicMock()
         client_mock.describe_table.return_value = {
@@ -609,149 +694,110 @@ class TestRunLimit:
             'write_pricing_category': 'WriteRequestUnits',
         }
 
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 3
-        df.toJSON.return_value.foreachPartition = MagicMock()
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        df.repartition.assert_called_with(200), "limit > 1000 triggers repartition"
-
-    def test_limit_under_1000_no_repartitioning(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
-    ):
-        """Line 145: limit <= 1000 does NOT set needsRepartitioning."""
         args = {
             'splits': '200', 'table': 't',
             'where': None, 'orderby': None, 'limit': '500',
             'XAction': 'delete',
             's3-bucket-name': 'b', 'JOB_RUN_ID': 'j',
         }
-        monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
-        monkeypatch.setattr(find_module, 'RateLimiterAggregator', MagicMock())
-        monkeypatch.setattr(find_module, 'RateLimiterWorker', MagicMock())
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
-        client_mock = MagicMock()
-        client_mock.describe_table.return_value = {
-            'Table': {'KeySchema': [{'AttributeName': 'pk', 'KeyType': 'HASH'}]}
-        }
-        monkeypatch.setattr(find_module, 'boto3', MagicMock(
-            Session=MagicMock(return_value=MagicMock(region_name='us-east-1')),
-            client=MagicMock(return_value=client_mock)
-        ))
-
-        pricing_instance = MagicMock()
-        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
-        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
-        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
-            'item_count': 100, 'size_bytes': 5000,
-            'billing_mode': 'PAY_PER_REQUEST',
-            'write_pricing_category': 'WriteRequestUnits',
-        }
-
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 3
-        df.toJSON.return_value.foreachPartition = MagicMock()
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        df.repartition.assert_not_called(), "limit <= 1000 skips repartition"
+        df.repartition.assert_not_called()
 
 
 # --- run(): DO_FIND branch ----------------------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestRunFindAction:
     """DO_FIND writes JSON to S3 and prints top-N records."""
 
     def test_find_writes_json_to_s3_location(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, base_args, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, base_args, capsys
     ):
-        """Lines 164-176: S3 output location derived from bucket + job_run_id."""
-        spark_session = MagicMock()
-        monkeypatch.setattr(find_module, 'SparkSession', MagicMock(return_value=spark_session))
-
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        """S3 output location derived from bucket + job_run_id."""
+        _, df = read_df
         df.count.return_value = 3
         json_rdd = MagicMock()
         df.toJSON.return_value = json_rdd
         df.limit.return_value.toJSON.return_value.collect.return_value = ['{"a":1}', '{"b":2}', '{"c":3}']
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, base_args)
+        spark_session = MagicMock()
+        monkeypatch.setattr(find_module, 'SparkSession', MagicMock(return_value=spark_session))
+
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), base_args)
 
         out = capsys.readouterr().out
         assert 's3://my-bucket/output/run-123' in out, "S3 path printed"
         spark_session.read.json.assert_called_once_with(json_rdd)
 
     def test_find_count_le_top_n_prints_all(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, base_args, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, base_args, capsys
     ):
-        """Line 180-181: count <= 10 prints 'N matching items:' header."""
-        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        """count <= 10 prints 'N matching items:' header."""
+        _, df = read_df
         df.count.return_value = 3
         df.limit.return_value.toJSON.return_value.collect.return_value = ['{"a":1}', '{"b":2}', '{"c":3}']
+        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, base_args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), base_args)
 
         out = capsys.readouterr().out
         assert '3 matching items:' in out
         assert 'more not printed' not in out
 
     def test_find_count_gt_top_n_prints_truncated(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, base_args, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, base_args, capsys
     ):
-        """Lines 183-188: count > 10 prints first 10 and '...and N more'."""
-        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        """count > 10 prints first 10 and '...and N more'."""
+        _, df = read_df
         df.count.return_value = 25
         records = [f'{{"id":{i}}}' for i in range(10)]
         df.limit.return_value.toJSON.return_value.collect.return_value = records
+        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, base_args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), base_args)
 
         out = capsys.readouterr().out
         assert 'First 10 matching items:' in out
         assert '15 more not printed' in out
 
     def test_find_prints_each_record(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, base_args, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, base_args, capsys
     ):
-        """Lines 185-186: each top-N record printed."""
-        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        """Each top-N record printed."""
+        _, df = read_df
         df.count.return_value = 2
         df.limit.return_value.toJSON.return_value.collect.return_value = ['{"x":1}', '{"y":2}']
+        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, base_args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), base_args)
 
         out = capsys.readouterr().out
         assert '{"x":1}' in out
         assert '{"y":2}' in out
 
     def test_find_caches_dataframe(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, base_args
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, base_args
     ):
-        """Line 161: records.cache() called before count."""
-        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        """records.cache() called before count."""
+        _, df = read_df
         df.count.return_value = 1
         df.limit.return_value.toJSON.return_value.collect.return_value = ['{}']
+        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, base_args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), base_args)
 
         df.cache.assert_called_once()
 
     def test_find_writes_count_items_message(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, base_args, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, base_args, capsys
     ):
-        """Line 190: 'Wrote N items in JSON format' message."""
-        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
+        """'Wrote N items in JSON format' message."""
+        _, df = read_df
         df.count.return_value = 42
         df.limit.return_value.toJSON.return_value.collect.return_value = [f'{{"i":{i}}}' for i in range(10)]
+        monkeypatch.setattr(find_module, 'SparkSession', MagicMock())
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, base_args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), base_args)
 
         out = capsys.readouterr().out
         assert 'Wrote 42 items in JSON format' in out
@@ -759,7 +805,6 @@ class TestRunFindAction:
 
 # --- run(): DO_DELETE branch --------------------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestRunDeleteAction:
     """DO_DELETE gets table keys, optionally repartitions, then deletes via
     foreachPartition."""
@@ -772,8 +817,12 @@ class TestRunDeleteAction:
             's3-bucket-name': 'bucket', 'JOB_RUN_ID': 'run-1',
         }
 
-    def _setup_delete_mocks(self, monkeypatch, glue_context):
+    def _setup_delete_mocks(self, monkeypatch, read_df, table_info_mocks):
         """Wire up the minimum mocks for the delete path to execute."""
+        _, df = read_df
+        df.count.return_value = 2
+        df.toJSON.return_value.foreachPartition = MagicMock()
+
         monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
         agg_instance = MagicMock()
         monkeypatch.setattr(find_module, 'RateLimiterAggregator', MagicMock(return_value=agg_instance))
@@ -791,16 +840,25 @@ class TestRunDeleteAction:
         )
         monkeypatch.setattr(find_module, 'boto3', boto3_mock)
 
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 2
-        df.toJSON.return_value.foreachPartition = MagicMock()
+        pricing_instance = MagicMock()
+        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
+        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
+        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
+            'item_count': 100, 'size_bytes': 5000,
+            'billing_mode': 'PAY_PER_REQUEST',
+            'write_pricing_category': 'WriteRequestUnits',
+        }
 
         return df, agg_instance
 
-    def test_delete_calls_get_table_keys(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+    def test_delete_calls_describe_table_for_keys(
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 150-155: boto3.client('dynamodb').describe_table called."""
+        """boto3.client('dynamodb').describe_table called."""
+        _, df = read_df
+        df.count.return_value = 0
+        df.toJSON.return_value.foreachPartition = MagicMock()
+
         args = self._delete_args()
         client_mock = MagicMock()
         client_mock.describe_table.return_value = {
@@ -822,85 +880,58 @@ class TestRunDeleteAction:
             'write_pricing_category': 'WriteRequestUnits',
         }
 
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 0
-        df.toJSON.return_value.foreachPartition = MagicMock()
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         client_mock.describe_table.assert_called_once_with(TableName='del-table')
 
     def test_delete_sends_count_to_pricing_generator(
-        self, monkeypatch, table_info_mocks, glue_context, capsys
+        self, monkeypatch, table_info_mocks, read_df, capsys
     ):
-        """Line 234: print_pricing_generator.send(count) passes item count."""
-        args = self._delete_args()
-        df, _ = self._setup_delete_mocks(monkeypatch, glue_context)
+        """print_pricing_generator.send(count) passes item count."""
+        df, _ = self._setup_delete_mocks(monkeypatch, read_df, table_info_mocks)
         df.count.return_value = 77
 
-        # PricingUtility mock for the generator's delete path
-        pricing_instance = MagicMock()
-        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
-        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
-
-        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
-            'item_count': 100, 'size_bytes': 5000,
-            'billing_mode': 'PAY_PER_REQUEST',
-            'write_pricing_category': 'WriteRequestUnits',
-        }
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        args = self._delete_args()
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         out = capsys.readouterr().out
         assert '77' in out, "delete count sent to pricing generator"
 
     def test_delete_prints_deleted_count(
-        self, monkeypatch, table_info_mocks, glue_context, capsys
+        self, monkeypatch, table_info_mocks, read_df, capsys
     ):
-        """Line 253: 'Deleted N items' printed after foreachPartition."""
-        args = self._delete_args()
-        df, _ = self._setup_delete_mocks(monkeypatch, glue_context)
+        """'Deleted N items' printed after foreachPartition."""
+        df, _ = self._setup_delete_mocks(monkeypatch, read_df, table_info_mocks)
         df.count.return_value = 15
 
-        pricing_instance = MagicMock()
-        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
-        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
-        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
-            'item_count': 100, 'size_bytes': 5000,
-            'billing_mode': 'PAY_PER_REQUEST',
-            'write_pricing_category': 'WriteRequestUnits',
-        }
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        args = self._delete_args()
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         out = capsys.readouterr().out
         assert 'Deleted 15 items' in out
 
     def test_delete_no_repartition_without_orderby_or_large_limit(
-        self, monkeypatch, table_info_mocks, glue_context, capsys
+        self, monkeypatch, table_info_mocks, read_df, capsys
     ):
-        """Line 225: needsRepartitioning=False skips select/repartition."""
+        """needsRepartitioning=False skips select/repartition."""
+        df, _ = self._setup_delete_mocks(monkeypatch, read_df, table_info_mocks)
+
         args = self._delete_args()
-        df, _ = self._setup_delete_mocks(monkeypatch, glue_context)
-
-        pricing_instance = MagicMock()
-        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
-        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
-        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
-            'item_count': 100, 'size_bytes': 5000,
-            'billing_mode': 'PAY_PER_REQUEST',
-            'write_pricing_category': 'WriteRequestUnits',
-        }
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         df.select.assert_not_called()
         df.repartition.assert_not_called()
 
     def test_delete_aggregator_shutdown_in_finally(
-        self, monkeypatch, table_info_mocks, glue_context, capsys
+        self, monkeypatch, table_info_mocks, read_df, capsys
     ):
-        """Line 252: rate_limiter_aggregator.shutdown() in finally block."""
+        """rate_limiter_aggregator.shutdown() in finally block."""
+        _, df = read_df
+        df.count.return_value = 1
+        df.toJSON.return_value.foreachPartition = MagicMock(
+            side_effect=RuntimeError('partition error')
+        )
+
         args = self._delete_args()
         monkeypatch.setattr(find_module, 'RateLimiterSharedConfig', MagicMock())
         agg_instance = MagicMock()
@@ -915,12 +946,6 @@ class TestRunDeleteAction:
             client=MagicMock(return_value=client_mock)
         ))
 
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 1
-        df.toJSON.return_value.foreachPartition = MagicMock(
-            side_effect=RuntimeError('partition error')
-        )
-
         pricing_instance = MagicMock()
         pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
         monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
@@ -931,48 +956,38 @@ class TestRunDeleteAction:
         }
 
         with pytest.raises(RuntimeError, match='partition error'):
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         agg_instance.shutdown.assert_called_once()
 
     def test_delete_throughput_configs_write_mode_monitor_format(
-        self, monkeypatch, table_info_mocks, glue_context, capsys
+        self, monkeypatch, table_info_mocks, read_df, capsys
     ):
-        """Line 246: get_dynamodb_throughput_configs called with write mode and monitor format."""
+        """get_dynamodb_throughput_configs called with write mode and monitor format."""
+        df, _ = self._setup_delete_mocks(monkeypatch, read_df, table_info_mocks)
+
         args = self._delete_args()
-        df, _ = self._setup_delete_mocks(monkeypatch, glue_context)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
-        pricing_instance = MagicMock()
-        pricing_instance.get_on_demand_capacity_pricing.return_value = {'WriteRequestUnits': '0.001'}
-        monkeypatch.setattr(find_module, 'PricingUtility', MagicMock(return_value=pricing_instance))
-        table_info_mocks.get_and_print_dynamodb_table_info.return_value = {
-            'item_count': 100, 'size_bytes': 5000,
-            'billing_mode': 'PAY_PER_REQUEST',
-            'write_pricing_category': 'WriteRequestUnits',
-        }
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
-
-        # Second call to get_dynamodb_throughput_configs is for delete (modes=["write"], format="monitor")
         calls = table_info_mocks.get_dynamodb_throughput_configs.call_args_list
-        # First call is for connection_options (modes=["read"])
-        # Second call is for monitor_options (modes=["write"], format="monitor")
-        assert len(calls) >= 2
-        second_call = calls[1]
-        assert second_call.kwargs.get('modes') == ['write']
-        assert second_call.kwargs.get('format') == 'monitor'
+        assert len(calls) >= 1
+        last_call = calls[-1]
+        assert last_call.kwargs.get('modes') == ['write']
+        assert last_call.kwargs.get('format') == 'monitor'
 
 
 # --- delete_partition (inner function) ----------------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestDeletePartition:
     """The inner delete_partition function is invoked by foreachPartition.
     We capture the lambda and invoke it to test delete behavior."""
 
-    def _capture_and_run_delete(self, monkeypatch, table_info_mocks, glue_context,
+    def _capture_and_run_delete(self, monkeypatch, table_info_mocks, read_df,
                                  partition_data, rl_worker_mock=None):
         """Set up delete path and capture + invoke the foreachPartition lambda."""
+        _, df = read_df
+        df.count.return_value = len(partition_data)
+
         args = {
             'splits': '200', 'table': 'del-table',
             'where': None, 'orderby': None, 'limit': None,
@@ -1018,9 +1033,6 @@ class TestDeletePartition:
             'write_pricing_category': 'WriteRequestUnits',
         }
 
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = len(partition_data)
-
         captured_fn = []
 
         def capture_foreach_partition(fn):
@@ -1028,7 +1040,7 @@ class TestDeletePartition:
 
         df.toJSON.return_value.foreachPartition = capture_foreach_partition
 
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         # Now invoke the captured lambda with our partition data
         assert len(captured_fn) == 1
@@ -1037,14 +1049,14 @@ class TestDeletePartition:
         return rl_worker_mock
 
     def test_deletes_items_by_key(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 215-219: each record parsed, keys extracted, delete_item called."""
+        """Each record parsed, keys extracted, delete_item called."""
         partition = [
             json.dumps({'pk': 'a', 'sk': '1', 'data': 'x'}),
             json.dumps({'pk': 'b', 'sk': '2', 'data': 'y'}),
         ]
-        rl_mock = self._capture_and_run_delete(monkeypatch, table_info_mocks, glue_context, partition)
+        rl_mock = self._capture_and_run_delete(monkeypatch, table_info_mocks, read_df, partition)
 
         bw = rl_mock.bw
         assert bw.delete_item.call_count == 2
@@ -1053,9 +1065,9 @@ class TestDeletePartition:
         assert {'pk': 'b', 'sk': '2'} in keys_deleted
 
     def test_delete_item_error_prints_but_continues(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 220-221: exception in delete_item prints error, continues loop."""
+        """Exception in delete_item prints error, continues loop."""
         rl_worker_mock = MagicMock()
         session = MagicMock()
         table = MagicMock()
@@ -1074,7 +1086,7 @@ class TestDeletePartition:
             json.dumps({'pk': 'b', 'sk': '2'}),
         ]
         self._capture_and_run_delete(
-            monkeypatch, table_info_mocks, glue_context, partition,
+            monkeypatch, table_info_mocks, read_df, partition,
             rl_worker_mock=rl_worker_mock
         )
 
@@ -1083,18 +1095,18 @@ class TestDeletePartition:
         assert bw.delete_item.call_count == 2, "continues after first error"
 
     def test_rate_limiter_worker_shutdown_in_finally(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 223: rate_limiter_worker.shutdown() called in finally."""
+        """rate_limiter_worker.shutdown() called in finally."""
         partition = [json.dumps({'pk': 'x', 'sk': 'y'})]
-        rl_mock = self._capture_and_run_delete(monkeypatch, table_info_mocks, glue_context, partition)
+        rl_mock = self._capture_and_run_delete(monkeypatch, table_info_mocks, read_df, partition)
 
         rl_mock.shutdown.assert_called_once()
 
     def test_rate_limiter_worker_shutdown_even_on_error(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 223: shutdown called even when batch_writer raises."""
+        """shutdown called even when batch_writer raises."""
         rl_worker_mock = MagicMock()
         session = MagicMock()
         table = MagicMock()
@@ -1110,19 +1122,18 @@ class TestDeletePartition:
 
         partition = [json.dumps({'pk': 'x', 'sk': 'y'})]
 
-        # The error will propagate from the partition function but shutdown should still be called
         with pytest.raises(RuntimeError, match='connection failed'):
             self._capture_and_run_delete(
-                monkeypatch, table_info_mocks, glue_context, partition,
+                monkeypatch, table_info_mocks, read_df, partition,
                 rl_worker_mock=rl_worker_mock
             )
 
         rl_worker_mock.shutdown.assert_called_once()
 
     def test_delete_partition_uses_config_with_timeouts(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Lines 203-209: Config with connect_timeout=4, read_timeout=4, 50 retries."""
+        """Config with connect_timeout=4, read_timeout=4, 50 retries."""
         seen_configs = []
 
         rl_worker_mock = MagicMock()
@@ -1151,7 +1162,7 @@ class TestDeletePartition:
 
         partition = [json.dumps({'pk': 'a', 'sk': 'b'})]
         self._capture_and_run_delete(
-            monkeypatch, table_info_mocks, glue_context, partition,
+            monkeypatch, table_info_mocks, read_df, partition,
             rl_worker_mock=rl_worker_mock
         )
 
@@ -1165,70 +1176,75 @@ class TestDeletePartition:
 
 # --- run(): warnings suppression and defaults ---------------------------------
 
-@pytest.mark.skip(reason="Asserts against legacy DynamicFrame code path; verb now goes through python_modules.shared.glue_connector wrapper. Followup: rewrite to assert against the wrapper boundary.")
 class TestRunMiscBehavior:
     """Miscellaneous behavior: default splits, warnings suppression."""
 
     def test_default_splits_is_200(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 61: splits defaults to '200' when not in parsed_args."""
+        """splits defaults to '200' when not in parsed_args."""
+        read_mock, df = read_df
+        df.count.return_value = 0
+
         args = {
             'table': 't', 'where': None, 'orderby': None, 'limit': None,
             'XAction': 'count',
         }
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
-        from_options_call = glue_context.create_dynamic_frame.from_options.call_args
-        conn_opts = from_options_call.kwargs['connection_options']
-        assert conn_opts['dynamodb.splits'] == '200'
+        read_mock.assert_called_once()
+        _, kwargs = read_mock.call_args
+        assert kwargs.get('splits') == '200'
 
     def test_warnings_suppressed_in_dataframe_path(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df
     ):
-        """Line 124: warnings.filterwarnings called for DataFrame constructor."""
+        """warnings.filterwarnings called for DataFrame constructor."""
+        _, df = read_df
+        df.count.return_value = 0
+
         with patch.object(find_module.warnings, 'filterwarnings') as mock_fw:
             args = {
                 'splits': '200', 'table': 't',
                 'where': 'x = 1', 'orderby': None, 'limit': None,
                 'XAction': 'count',
             }
-            find_module.run(MagicMock(), MagicMock(), glue_context, args)
+            find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
             mock_fw.assert_called_once_with(
                 "ignore",
                 message="DataFrame constructor is internal. Do not directly use it."
             )
 
     def test_count_with_orderby_uses_dataframe(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 74, 118: count + ORDERBY forces DataFrame path (not simple count)."""
+        """count + ORDERBY forces DataFrame processing path (not simple count)."""
+        _, df = read_df
+        df.count.return_value = 99
+
         args = {
             'splits': '200', 'table': 't',
             'where': None, 'orderby': 'col asc', 'limit': None,
             'XAction': 'count',
         }
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 99
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         out = capsys.readouterr().out
         assert '99' in out
 
     def test_count_with_limit_uses_dataframe(
-        self, monkeypatch, table_info_mocks, boto3_session_mock, glue_context, capsys
+        self, monkeypatch, table_info_mocks, boto3_session_mock, read_df, capsys
     ):
-        """Lines 74, 118: count + LIMIT forces DataFrame path."""
+        """count + LIMIT forces DataFrame processing path."""
+        _, df = read_df
+        df.count.return_value = 8
+
         args = {
             'splits': '200', 'table': 't',
             'where': None, 'orderby': None, 'limit': '10',
             'XAction': 'count',
         }
-        df = glue_context.create_dynamic_frame.from_options.return_value.toDF.return_value
-        df.count.return_value = 8
-
-        find_module.run(MagicMock(), MagicMock(), glue_context, args)
+        find_module.run(MagicMock(), MagicMock(), MagicMock(), args)
 
         out = capsys.readouterr().out
         assert '8' in out
