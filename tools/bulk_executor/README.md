@@ -97,6 +97,22 @@ Here are some example use cases:
 ./bulk scancount --table t --segments 10000 --sample-fraction 0.01 --per-segment --filter-expression "#ts < :cutoff" --expression-names '{"#ts": "timestamp"}' --expression-values '{":cutoff":"2025-01-01"}'
 
 
+# Find items using a direct scan and write them to S3 as DynamoDB JSON
+# Unlike "find", this preserves DynamoDB's types exactly: sets stay sets,
+# numbers keep their full precision, binary stays binary, nulls are kept
+./bulk scanfind --table t
+
+# Same filter-expression push-down as scancount, except the values are given
+# in DynamoDB JSON, because scanfind talks to the low-level DynamoDB API
+./bulk scanfind --table t --filter-expression "#touched > :touched" --expression-names '{"#touched": "touched"}' --expression-values '{":touched": {"N": "1742359403"}}'
+
+# Scan an index instead of the base table
+./bulk scanfind --table t --index i
+
+# Sample a handful of items to inspect their exact stored shape
+./bulk scanfind --table t --limit 25
+
+
 # Compare two tables for differences (uses segmented scans internally)
 # You can specify a name or a full ARN. Using an ARN lets you diff cross-region and cross-account!
 # If going cross-account, you need a resource-based policy on the table to allow access.
@@ -393,7 +409,7 @@ The teardown process will not remove any output written to S3 during bulk execut
 
 ## Run the bulk actions
 
-Once you've completed bootstrapping, the regular bulk script actions can be performed by anyone with permission to run the Glue job. There are various actions available out of the box: `count`, `find`, `delete`, `fill`, `update`, `scancount`, `diff`, `sql`, `load-export`, and `revert-export`.
+Once you've completed bootstrapping, the regular bulk script actions can be performed by anyone with permission to run the Glue job. There are various actions available out of the box: `count`, `find`, `delete`, `fill`, `update`, `scancount`, `scanfind`, `diff`, `sql`, `load-export`, and `revert-export`.
 
 Executing a bulk job:
 
@@ -500,6 +516,19 @@ If you ever want to stop execution early, you can hit Control-C. The interrupt w
 * Accepts an optional `per-segment` flag to print the item count for each scan segment (sorted descending, with each segment's share of the total). It also reports a skew ratio (hottest segment count / mean) and warns when that ratio exceeds 5x, which indicates an uneven key distribution / hot partition.
 * Accepts an optional `segments` parameter to control how many parallel scan segments are used (default 200). Lower it for small tables; raise it for finer per-segment resolution when diagnosing skew.
 * Accepts an optional `sample-fraction` (`> 0` and `≤ 1.0`, default `1.0`) to scan only a fraction of the segments and extrapolate an estimated total, reported with a 95% confidence interval. Because an unfiltered item count is already available for free (and exact) from `DescribeTable`, sampling is intended to be paired with a `filter-expression`: it estimates how many items match a predicate without paying for a full scan. The margin of error is driven by how evenly matches are spread across segments, so `per-segment` shows the skew behind it (with only one segment sampled, a point estimate is printed without an interval).
+
+#### `scanfind`
+
+* Performs a parallel scan to find matching items and writes them to S3 as **DynamoDB JSON** — the wire format a `scan` call actually returns (`{"pk": {"S": "..."}, "count": {"N": "5"}}`), one item per line.
+* Unlike `find`, which reads through the Glue DynamoDB Connector and a Spark DataFrame, `scanfind` scans DynamoDB directly and never lets a DataFrame touch the items. That preserves DynamoDB's type system exactly: string/number/binary sets stay sets, numbers keep their full 38 digits of precision instead of becoming doubles, binary stays binary, and `NULL` attributes are kept rather than dropped. Use `find` to look at data, `scanfind` when the output has to be a faithful copy of what is stored.
+* Requires a `table` parameter.
+* Accepts an optional `index` name to scan an index instead of the base table. Index scans return the index's projected attributes.
+* Accepts a `filter-expression` to filter the items returned, pushed down to DynamoDB. Requires a supporting `expression-values` parameter and sometimes `expression-names`, as with usual DynamoDB scan calls.
+    * Note: because `scanfind` uses the low-level DynamoDB API, `expression-values` are given in DynamoDB JSON — `'{":n": {"N": "5"}}'`, not `'{":n": 5}'`. This differs from `scancount`. `expression-names` are plain strings in both.
+* Accepts an optional `limit` to cap how many items are returned in total (across all segments). Handy for sampling a few items to inspect their exact stored shape.
+* Accepts an optional `segments` parameter to control how many parallel scan segments are used (default 200). Lower it for small tables.
+* Always writes the full result to S3 (under `s3://<bucket>/output/<job-run-id>/`) and prints the first 10 items to the console with a pointer to the S3 location, like `find`, `sql`, and `diff`. The console preview is capped because console delivery via CloudWatch Live Tail is bandwidth-limited; the complete result is always in S3.
+* Note that a worker failing partway through does not roll back what has already been written, so the S3 prefix may hold a partial result when the command reports an error. The error message says so.
 
 #### `diff`
 
