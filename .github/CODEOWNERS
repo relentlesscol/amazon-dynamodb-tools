@@ -1,0 +1,21 @@
+# Ownership boundaries for amazon-dynamodb-tools.
+#
+# CODEOWNERS is LAST-MATCH-WINS. Order matters: a specific delegation must
+# appear BELOW the broad rule it is meant to override, or it has no effect.
+
+# ---- Repo infrastructure: broad protection, declared first ----
+/.github/                                      @relentlesscol
+
+# ---- Per-tool ownership: each tool owns its own directory ----
+/tools/dax_calculator/                         @relentlesscol
+
+# ---- Delegated workflow file ----
+# This line sits BELOW /.github/ on purpose, so the tool owners (not the repo
+# admins) are the code owners of this one workflow. Everything else under
+# /.github/ stays admin-owned, so no other workflow can be added or edited
+# without an admin review.
+#
+# In awslabs/startups the equivalent pair would be:
+#   /startuplabs/                              @awslabs/startups-startuplabs
+#   /.github/workflows/startuplabs.yml         @awslabs/startups-startuplabs
+/.github/workflows/dax-calculator-checks.yml   @relentlesscol

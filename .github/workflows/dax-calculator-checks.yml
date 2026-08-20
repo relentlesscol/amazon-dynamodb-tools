@@ -1,0 +1,39 @@
+name: "dax_calculator: checks"
+
+# Thin caller. Every step of the actual test logic lives in
+# tools/dax_calculator/ci/checks/action.yml, which the dax_calculator
+# maintainers own via CODEOWNERS. They can change tool versions, add
+# scanners, or restructure the test matrix without touching this file
+# and without an admin review.
+#
+# What stays fixed here (and therefore admin-controlled):
+#   - the trigger and its path filter
+#   - the GITHUB_TOKEN permissions envelope
+#   - runs-on
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/dax_calculator/**'
+      - '.github/workflows/dax-calculator-checks.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/dax_calculator/**'
+      - '.github/workflows/dax-calculator-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run dax_calculator checks
+        uses: ./tools/dax_calculator/ci/checks
+        with:
+          python-version: '3.11'
