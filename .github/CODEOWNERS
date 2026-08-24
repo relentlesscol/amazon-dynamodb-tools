@@ -1,0 +1,13 @@
+# EXPERIMENT: does GitHub accept a prefix glob inside a path segment?
+
+# 1. control: known-good simple directory rule
+/tools/dax_calculator/                          @relentlesscol
+
+# 2. THE CLAIM UNDER TEST: prefix glob inside .github/workflows
+/.github/workflows/dax-*.yml                    @relentlesscol
+
+# 3. control: deliberately invalid owner, MUST be flagged or the endpoint is useless
+/tools/bulk_executor/                           @this-user-does-not-exist-zzq9
+
+# 4. control: documented-unsupported gitignore negation, MUST be flagged
+!/tools/dax_calculator/README.md                @relentlesscol
