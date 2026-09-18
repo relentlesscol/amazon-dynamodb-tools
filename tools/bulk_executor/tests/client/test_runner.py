@@ -12,14 +12,15 @@ Covers `client/src/runner.py`:
   BulkExecutorError suppression flag, GlueExceptionAnalysisListener
   noise gate, output-vs-non-output formatting, GRAY/PINK/YELLOW/default
   color routing)
-- _is_job_state_unhealthy: matches against UNHEALTHY_STATE_LOG_MESSAGE_KEYS
+- _unhealthy_signal: matches against UNHEALTHY_STATE_LOG_SIGNALS, and returns the
+  signal so the stop can be explained rather than merely announced
 - _wait_for_log_groups_to_exist: success on first try, retry/log/sleep
   loop on missing groups, ClientError handling, max-retries exit path
 - _watch_log_group: sessionStart pass-through, sessionUpdate happy path,
   unhealthy-event termination, terminal-state termination, succeeded
   shutdown counter, RuntimeError on unknown event, reconnect on
-  ConnectionError/HTTPClientError/EventStreamError, generic-exception
-  handler
+  ConnectionError/HTTPClientError/EventStreamError and on raw urllib3
+  ReadTimeoutError/ProtocolError, generic-exception handler
 - _watch_glue_job: spawns one daemon thread per log group ARN
 - _get_job_run_state / _get_job_run_error_message: get_job_run wiring,
   exception → exit() error paths
@@ -36,12 +37,17 @@ Covers `client/src/runner.py`:
 - run: arg-prep failure short-circuit, full happy path with state
   transitions (STOPPING/STOPPED/FAILED/TIMEOUT/SUCCEEDED), unhandled
   state error log, DPU-hours formatting branch, error-message logging
+- the closing lines, driven through _execute_job: a stop bulk caused reads as a
+  failure naming the reason, while a user's Ctrl+C still reads as a stop; Glue's
+  own OUT_OF_MEMORY_ERROR message earns the same advice; and the advice prints
+  once however many paths recognise the run
 
 Tests are written test-first against current behavior so they serve
 as a regression harness.
 """
 
 import json
+import logging
 import sys
 from unittest.mock import MagicMock, patch, call
 
@@ -52,6 +58,7 @@ from botocore.exceptions import (
     EventStreamError,
     HTTPClientError,
 )
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
 # Ensure client/src is on sys.path for runner imports (pytest.ini already
 # adds it, but be explicit here in case this file is collected differently).
@@ -67,6 +74,8 @@ if _CLIENT_SRC not in sys.path:
 with patch('clients.Clients') as _MockClients:
     _MockClients.return_value = MagicMock()
     import runner as runner_module  # noqa: E402
+
+import utils  # noqa: E402  same package the runner reads its constants from
 
 
 # --- Fixtures ---------------------------------------------------------------
@@ -236,6 +245,10 @@ def _make_event(message='hello\n', log_group=None, stream='stream-x', timestamp=
     }
 
 
+# Verbatim CloudWatch event from a successful `copy` (issue #334): Glue's metrics
+# reporter logging its own suppressed exception, header plus 18 frames in one event.
+GLUE_METRICS_REPORTER_EVENT = "2026-09-01 04:33:39 ERROR ScheduledReporter:208 - Exception thrown from AWSDILyraMetricsReporter#report. Exception was suppressed.\njava.util.ConcurrentModificationException: null\n\tat java.base/java.util.ArrayList.sort(ArrayList.java:1723) ~[?:?]\n\tat org.apache.spark.metrics.source.AutoDebuggingStageSkewness.getCurrentSkewness(AWSDILyraSource.scala:113) ~[aws-glue-di-package.jar:4.1.1-amzn-0]\n\tat org.apache.spark.metrics.source.AutoDebuggingStageSkewness.$anonfun$getValue$1(AWSDILyraSource.scala:145) ~[aws-glue-di-package.jar:4.1.1-amzn-0]\n\tat org.apache.spark.metrics.source.AutoDebuggingStageSkewness.$anonfun$getValue$1$adapted(AWSDILyraSource.scala:145) ~[aws-glue-di-package.jar:4.1.1-amzn-0]\n\tat java.base/java.util.concurrent.ConcurrentHashMap$KeySetView.forEach(ConcurrentHashMap.java:4706) ~[?:?]\n\tat org.apache.spark.metrics.source.AutoDebuggingStageSkewness.getValue(AWSDILyraSource.scala:145) ~[aws-glue-di-package.jar:4.1.1-amzn-0]\n\tat org.apache.spark.metrics.source.AutoDebuggingStageSkewness.getValue(AWSDILyraSource.scala:77) ~[aws-glue-di-package.jar:4.1.1-amzn-0]\n\tat org.apache.spark.metrics.sink.AWSDILyraMetricsReporter.reportGauge(AWSDILyraMetricsReporter.java:135) ~[aws-glue-di-package.jar:?]\n\tat org.apache.spark.metrics.sink.AWSDILyraMetricsReporter.report(AWSDILyraMetricsReporter.java:80) ~[aws-glue-di-package.jar:?]\n\tat com.codahale.metrics.ScheduledReporter.report(ScheduledReporter.java:280) ~[metrics-core-4.2.37.jar:4.2.37]\n\tat com.codahale.metrics.ScheduledReporter.lambda$start$0(ScheduledReporter.java:206) ~[metrics-core-4.2.37.jar:4.2.37]\n\tat java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:539) [?:?]\n\tat java.base/java.util.concurrent.FutureTask.runAndReset(FutureTask.java:305) [?:?]\n\tat java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:305) [?:?]\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136) [?:?]\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635) [?:?]\n\tat java.base/java.lang.Thread.run(Thread.java:840) [?:?]\n"
+
 class TestPrettyPrintLogEvent:
     """Tests for log event routing and color decoration (lines 88-135)."""
 
@@ -269,20 +282,492 @@ class TestPrettyPrintLogEvent:
         bulk_runner._pretty_print_log_event(ev)
         assert capsys.readouterr().out == ''
 
+    def test_suppresses_benign_netty_stream_error(self, bulk_runner, capsys):
+        """Issue #247: the real (non-monkeypatched) ignore list drops the benign
+        Netty error that otherwise prints red.
+
+        log4j emits this stack trace as a single logging record with embedded
+        newlines (which is why all its lines print uniformly red), so it arrives
+        as one log event. The whole event -- header plus the ...ChannelException
+        and `at ...` continuation lines -- must be suppressed together, since only
+        the header carries the ignore-list anchor substring."""
+        ev = _make_event(message=(
+            "2026-08-04 04:17:36 ERROR TransportRequestHandler:326 - Error sending "
+            "result StreamResponse[streamId=/jars/x.jar,byteCount=36261796,body=...] "
+            "to /172.34.52.242:55286; closing connection\n"
+            "io.netty.channel.StacklessClosedChannelException: null\n"
+            "\tat io.netty.channel.AbstractChannel.close(ChannelPromise)(Unknown Source) "
+            "~[emr-spark-goodies-3.21.0.jar:3.21.0]"
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        # Nothing leaks -- not the header, not the continuation lines.
+        assert captured.out == ''
+        assert captured.err == ''
+
+    def test_suppresses_glue6_runscript_syntaxwarning(self, bulk_runner, capsys):
+        """Issue #292: the real (non-monkeypatched) ignore list drops the
+        SyntaxWarning Glue 6.0 emits from its own job wrapper.
+
+        Glue 6.0 runs Python 3.13, which surfaces the invalid escape sequences in
+        pythonrunner/runscript.py as a visible SyntaxWarning on every job run.
+        The message below is verbatim from CloudWatch (/aws-glue/jobs/output):
+        Python writes the warning and its echoed source line in a single write(),
+        and that survives Glue's log collection as ONE event with embedded
+        newlines -- so suppressing it needs only the one anchor substring, and
+        the echoed source line cannot leak out on its own.
+        """
+        ev = _make_event(message=(
+            "/tmp/glue-job-7400852053095722040/pythonrunner/runscript.py:34: "
+            "SyntaxWarning: invalid escape sequence '\\.'\n"
+            '  p = re.compile("Job aborted due to stage failure: Task [0-9]+ in '
+            "stage [0-9]+\\.[0-9]+ failed [0-9]+ times, most recent failure: Lost "
+            "task [0-9]+\\.[0-9]+ in stage [0-9]+\\.[0-9]+ \\(TID [0-9]+, "
+            'ip.*.ec2.internal, executor [0-9]\\):\\w*")\n'
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        # Neither the warning header nor the echoed regex source leaks. The
+        # latter matters most: it reads "Job aborted due to stage failure" and
+        # would alarm users far more than the warning it belongs to.
+        assert captured.out == ''
+        assert captured.err == ''
+
+    def test_suppresses_glue_metrics_reporter_stack(self, bulk_runner, capsys):
+        """Issue #334: the real ignore list drops the Java stack Glue's own metrics
+        reporter emits on a successful run.
+
+        The message below is verbatim from CloudWatch (/aws-glue/jobs/output) for a
+        `copy` that succeeded and reported `Total records copied: 3`. Glue's
+        ScheduledReporter logs a ConcurrentModificationException at ERROR and says in the
+        same line that it suppressed it; the header and all 18 frames arrive as ONE event
+        with embedded newlines, so one anchor drops the lot. Every frame is
+        aws-glue-di-package.jar or metrics-core -- none of it is ours, and it lands right
+        before the result line where the user is looking.
+        """
+        ev = _make_event(message=GLUE_METRICS_REPORTER_EVENT)
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        # Neither the header nor a single frame leaks: 18 orphaned "at org.apache.spark"
+        # lines with nothing above them would be worse than the original noise.
+        assert captured.out == ''
+        assert captured.err == ''
+
+    def test_driver_failure_marker_suppresses_the_glue_blob(self, bulk_runner, capsys, monkeypatch):
+        """#332: an understood driver-side failure prints one sentence, and Glue's
+        exception-analysis blob that sometimes follows a clean sys.exit is dropped.
+
+        Glue emits that blob unpredictably -- observed after a denied `find` but not after a
+        denied `count` in the same batch -- so this is asserted here rather than trusted to
+        show up in a live run."""
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+
+        denial = _make_event(message=(
+            "Bulk Executor failure: User: arn:aws:sts::1:assumed-role/R/GlueJobRunnerSession is not "
+            "authorized to perform: dynamodb:Scan on resource: table/t"
+        ))
+        bulk_runner._pretty_print_log_event(denial)
+        first = capsys.readouterr().out
+        assert 'not authorized to perform' in first, "the sentence itself must print"
+
+        blob = _make_event(message=(
+            "2026-09-01 08:49:19 ERROR GlueExceptionAnalysisListener:9 - "
+            "[Glue Exception Analysis] {\"Failure Reason\": \"Traceback (most recent call last)...\"}"
+        ))
+        bulk_runner._pretty_print_log_event(blob)
+        assert capsys.readouterr().out == '', "Glue's restatement adds nothing after it"
+
+    def test_suppresses_sparks_own_query_analysis_dump(self, bulk_runner, capsys):
+        """#332: Spark logs an analysis failure itself, at ERROR, as one JSON event holding
+        the message plus ~90 Java frames and the query plan -- before our handler turns it
+        into "SQL query error: ...". Measured on a mistyped column: 90 of 148 lines.
+
+        The message below is the head of the verbatim CloudWatch event (10,850 chars, a
+        single event, so one anchor drops all of it).
+        """
+        ev = _make_event(message="{\"ts\": \"2026-09-01 09:31:40.589\", \"level\": \"ERROR\", \"logger\": \"SQLQueryContextLogger\", \"msg\": \"[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `nosuchcolumn` cannot be resolved. Did you mean one of the following? [`payload`, `sk`, `pk`]. SQLSTATE: 42703\", \"context\": {\"errorClass\": \"UNRESOLVED_COLUMN.WITH_SUGGESTION\"}, \"exception\": {\"class\": \"Py4JJavaError\", ")
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        assert captured.out == '' and captured.err == ''
+
+    def test_our_own_sql_query_error_still_prints(self, bulk_runner, capsys):
+        """Guard: the anchor is Spark's logger name, not the error text, so the sentence the
+        verb produces is unaffected."""
+        ev = _make_event(message=(
+            "2026-09-01 09:31:41,173 ERROR - BulkExecutorError: SQL query error: "
+            "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column with name `nosuchcolumn` cannot be resolved"
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        assert 'UNRESOLVED_COLUMN' in captured.out + captured.err
+
+    def test_sparks_own_failure_wording_does_not_trip_the_marker(self, bulk_runner, monkeypatch):
+        """The client matches markers as substrings, so a generic word would misfire. Spark
+        has plenty of "...Failure" shapes; none of them may be mistaken for the job saying
+        it has explained itself, or Glue's diagnostics get suppressed for a failure nobody
+        described."""
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+
+        for spark_line in (
+            "ERROR TaskSetManager: Lost task 3.0 in stage 2.0: ExecutorLostFailure: "
+            "executor 7 exited unrelated to the running tasks",
+            "WARN TaskSetManager: Lost task 1.0: FetchFailure: shuffle block missing",
+            'ERROR GlueExceptionAnalysisListener:9 - {"Failure Reason": "boom"}',
+            "ERROR DAGScheduler: Job aborted due to stage failure: Task 0 failed 4 times",
+        ):
+            bulk_runner._suppress_glue_noise = False
+            bulk_runner._pretty_print_log_event(_make_event(message=spark_line))
+            assert bulk_runner._suppress_glue_noise is False, (
+                f"{spark_line[:60]!r} must not read as the job explaining itself"
+            )
+
+    def test_the_summary_is_wired_into_the_closing_sequence(self, bulk_runner, caplog, monkeypatch):
+        """Counting is useless if nobody reports it. Drives _execute_job to its end and
+        asserts the summary lands with the closing lines, above the outcome."""
+        import logging
+
+        monkeypatch.setattr(bulk_runner, '_start_glue_job', lambda *a: 'jr_test')
+        monkeypatch.setattr(bulk_runner, '_watch_glue_job', lambda *a: None)
+        monkeypatch.setattr(bulk_runner, '_watch_for_interrupt', lambda *a: None)
+        monkeypatch.setattr(bulk_runner, '_get_job_run_state', lambda *a: 'SUCCEEDED')
+        monkeypatch.setattr(bulk_runner, '_get_job_run_error_message', lambda *a: None)
+        monkeypatch.setattr(bulk_runner, '_get_job_run_dpu', lambda *a, **kw: 0)
+        bulk_runner._suppressed_noise = {'executors released mid-run': 3}
+
+        with caplog.at_level(logging.INFO):
+            bulk_runner._execute_job({}, {})
+
+        messages = [r.message for r in caplog.records]
+        summary = next((i for i, m in enumerate(messages)
+                        if 'not displayed' in m), None)
+        outcome = next((i for i, m in enumerate(messages)
+                        if m.startswith('Job completed successfully')), None)
+        assert summary is not None, "the run must admit what it withheld"
+        assert outcome is not None, "sanity: the closing line was reached"
+        assert summary < outcome, "the admission belongs above the outcome, not after it"
+
+    def _drive_to_close(self, bulk_runner, monkeypatch, state, error_message=None):
+        """Run _execute_job to its closing lines with the Glue state we choose."""
+        monkeypatch.setattr(bulk_runner, '_start_glue_job', lambda *a: 'jr_test')
+        monkeypatch.setattr(bulk_runner, '_watch_glue_job', lambda *a: None)
+        monkeypatch.setattr(bulk_runner, '_watch_for_interrupt', lambda *a: None)
+        monkeypatch.setattr(bulk_runner, '_get_job_run_state', lambda *a: state)
+        monkeypatch.setattr(bulk_runner, '_get_job_run_error_message', lambda *a: error_message)
+        monkeypatch.setattr(bulk_runner, '_get_job_run_dpu', lambda *a, **kw: 0)
+        # Every non-SUCCEEDED state exits non-zero (issue #137), which is the point of
+        # those states; the closing lines are already logged by then.
+        with pytest.raises(SystemExit):
+            bulk_runner._execute_job({}, {})
+
+    JVM_OOM_BANNER = (
+        "#\n"
+        "# java.lang.OutOfMemoryError: Java heap space\n"
+        '# -XX:OnOutOfMemoryError="/usr/bin/bash /tmp/glue-job-3005627601503484264'
+        '/exception_catch/onOOMError.sh %p jr_b48f57b7 bulk_dynamodb true true"\n'
+        '#   Executing /bin/sh -c "/usr/bin/bash /tmp/glue-job-3005627601503484264'
+        '/exception_catch/onOOMError.sh 162 jr_b48f57b7 true true"...\n'
+    )
+
+    def test_the_jvm_oom_banner_is_suppressed_whole(self, bulk_runner, capsys, monkeypatch):
+        """Captured verbatim from a driver that ran out of memory. All four lines arrive as
+        one event, so the heap error goes with the hook noise -- deliberate, because we
+        print our own sentence instead, and it beats a banner naming a /tmp path on a
+        machine the user cannot reach."""
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+
+        bulk_runner._pretty_print_log_event(_make_event(message=self.JVM_OOM_BANNER))
+
+        out = capsys.readouterr()
+        assert out.out == '' and out.err == ''
+        assert bulk_runner._suppressed_noise == {}, 'silent, not counted'
+
+    def test_suppressing_the_banner_cannot_hide_the_signal(self, bulk_runner):
+        """The invariant that makes the suppression safe: the health check reads raw events,
+        so the same block still stops the job."""
+        signal = bulk_runner._unhealthy_signal({'message': self.JVM_OOM_BANNER})
+        assert signal is not None
+        assert signal.summary == 'the job ran out of memory'
+
+    def test_a_stop_we_caused_closes_by_naming_the_reason(self, bulk_runner, caplog, monkeypatch):
+        """The measured bug: an executor ran out of memory, bulk stopped the job, and the
+        last line was "Job was stopped." in warning yellow -- identical to Ctrl+C, with the
+        words "out of memory" nowhere in the run."""
+        bulk_runner._unhealthy_signal_seen = utils.UnhealthySignal(
+            'OutOfMemoryError:', 'the job ran out of memory', 'advice')
+
+        with caplog.at_level(logging.INFO):
+            self._drive_to_close(bulk_runner, monkeypatch, 'STOPPED')
+
+        closing = [r for r in caplog.records if 'Job duration' in r.message][-1]
+        assert 'the job ran out of memory' in closing.message
+        assert 'Job was stopped' not in closing.message
+        assert closing.levelno == logging.ERROR, \
+            "a stop we caused is a failure, not the yellow of a user interrupt"
+
+    def test_a_user_stop_still_reads_as_a_stop(self, bulk_runner, caplog, monkeypatch):
+        """Ctrl+C sets no signal, so nothing about it changes."""
+        with caplog.at_level(logging.INFO):
+            self._drive_to_close(bulk_runner, monkeypatch, 'STOPPED')
+
+        closing = [r for r in caplog.records if 'Job duration' in r.message][-1]
+        assert closing.message.startswith('Job was stopped.')
+        assert closing.levelno == logging.WARNING
+
+    def test_glue_error_message_naming_memory_gets_the_advice(self, bulk_runner, caplog, monkeypatch):
+        """The path with no watchdog match at all: a driver that dies too fast to log one.
+        Glue's own closing sentence is then the only evidence -- measured verbatim below."""
+        glue_said = ("SystemExit: SQL query error: [Errno 111] Connection refused caused by "
+                     "Error Category: OUT_OF_MEMORY_ERROR; Glue job failed due to driver out "
+                     "of memory")
+
+        with caplog.at_level(logging.INFO):
+            self._drive_to_close(bulk_runner, monkeypatch, 'FAILED', error_message=glue_said)
+
+        assert utils.MEMORY_ADVICE in caplog.text, \
+            "Glue named the category; the run must not end without saying what to change"
+
+    def test_an_unrelated_failure_gets_no_memory_advice(self, bulk_runner, caplog, monkeypatch):
+        with caplog.at_level(logging.INFO):
+            self._drive_to_close(bulk_runner, monkeypatch, 'FAILED',
+                                 error_message="SystemExit: Invalid 'where': no such column")
+
+        assert utils.MEMORY_ADVICE not in caplog.text
+
+    def test_memory_advice_is_not_repeated_when_both_paths_notice(self, bulk_runner, caplog, monkeypatch):
+        """Watchdog and closing message can both be right about the same run. The watchdog
+        printed the advice at detection, so the closing path must not say it again -- a
+        repeated paragraph reads as two separate problems."""
+        bulk_runner._unhealthy_signal_seen = [
+            s for s in utils.UNHEALTHY_STATE_LOG_SIGNALS
+            if s.pattern == 'OutOfMemoryError:'][0]
+
+        with caplog.at_level(logging.INFO):
+            self._drive_to_close(bulk_runner, monkeypatch, 'STOPPED',
+                                 error_message="Error Category: OUT_OF_MEMORY_ERROR")
+
+        assert utils.MEMORY_ADVICE not in caplog.text, \
+            'already given at detection, which this test does not reach'
+
+    def test_counted_noise_is_hidden_but_tallied(self, bulk_runner, capsys, monkeypatch):
+        """Noise we are not certain about is suppressed *and* counted, so the closing
+        summary can admit something was withheld."""
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+
+        for message in (
+            '{"ts": "2026-09-01 09:31:40", "level": "ERROR", "logger": '
+            '"SQLQueryContextLogger", "msg": "[UNRESOLVED_COLUMN] ..."}',
+            "ERROR TaskSchedulerImpl:267 - Lost executor 11 on 172.36.43.99: Remote RPC "
+            "client disassociated. Likely due to containers exceeding thresholds, or "
+            "network issues. Check driver logs for WARN messages.",
+            "ERROR TaskSchedulerImpl:267 - Lost executor 18 on 172.34.21.25: Remote RPC "
+            "client disassociated. Likely due to containers exceeding thresholds, or "
+            "network issues. Check driver logs for WARN messages.",
+        ):
+            bulk_runner._pretty_print_log_event(_make_event(message=message))
+
+        assert capsys.readouterr().out == '', "none of it reaches the console"
+        assert bulk_runner._suppressed_noise == {
+            'Spark query-analysis dumps': 1,
+            'executors released mid-run': 2,
+        }
+
+    def test_noise_we_are_sure_about_is_not_counted(self, bulk_runner, capsys):
+        """A heads-up about output that never matters is the noise again in a smaller font.
+        Glue's metrics reporter failing to report, and Netty failing to stream to a closed
+        channel, are suppressed with nothing said."""
+        for message in (
+            "ERROR ScheduledReporter:208 - Exception thrown from AWSDILyraMetricsReporter#report.",
+            "ERROR TransportRequestHandler: Error sending result StreamResponse{...}",
+            "Running autoDebugger shutdown hook.",
+        ):
+            bulk_runner._pretty_print_log_event(_make_event(message=message))
+
+        assert capsys.readouterr().out == '', "still suppressed"
+        assert bulk_runner._suppressed_noise == {}, "and not worth mentioning"
+
+    def test_summary_names_what_was_withheld(self, bulk_runner, caplog):
+        import logging
+
+        bulk_runner._suppressed_noise = {'executors released mid-run': 21,
+                                        'Netty stream-response errors': 1}
+        with caplog.at_level(logging.WARNING):
+            bulk_runner._report_suppressed_noise()
+
+        line = ' '.join(r.message for r in caplog.records)
+        assert line.startswith('22 known Glue/Spark messages'), "lead with the total"
+        assert '21 x executors released mid-run' in line, "biggest count first"
+        assert '1 x Netty stream-response errors' in line
+        assert 'CloudWatch' in line and '/aws-glue/jobs/output' in line, "say where to look"
+        assert [r.levelname for r in caplog.records] == ['WARNING'], (
+            "the run may have succeeded; this is not itself an error"
+        )
+
+    def test_summary_uses_singular_for_one(self, bulk_runner, caplog):
+        import logging
+
+        bulk_runner._suppressed_noise = {'Glue metrics-reporter exceptions': 1}
+        with caplog.at_level(logging.WARNING):
+            bulk_runner._report_suppressed_noise()
+
+        assert '1 known Glue/Spark message' in caplog.records[0].message
+        assert 'was not displayed' in caplog.records[0].message
+
+    def test_no_summary_when_nothing_was_suppressed(self, bulk_runner, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            bulk_runner._report_suppressed_noise()
+
+        assert caplog.records == [], "silence when there is nothing to admit"
+
+    def test_evidence_of_lost_work_is_never_suppressed(self, bulk_runner, capsys, monkeypatch):
+        """The line about an executor going away is noise; the lines about work actually
+        being lost are how a dying cluster announces itself (#302). Those must print and
+        must not be counted, or suppressing the symptom would hide the diagnosis."""
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+
+        for message in (
+            "WARN TaskSetManager: Lost task 12.0 in stage 4.0 (TID 913) (executor 7 "
+            "exited caused by one of the running tasks) Reason: Container killed",
+            "ERROR TaskSetManager: Task 3 in stage 2.0 failed 4 times; aborting job",
+            "ERROR DAGScheduler: Job aborted due to stage failure: Task 0 failed 4 times",
+            "ExecutorLostFailure (executor 5 exited caused by one of the running tasks)",
+            "Container killed by YARN for exceeding memory limits",
+        ):
+            bulk_runner._pretty_print_log_event(_make_event(message=message))
+            printed = capsys.readouterr()
+            assert (printed.out + printed.err).strip(), f"must reach the user: {message[:50]}"
+
+        assert bulk_runner._suppressed_noise == {}, "none of these are noise"
+
+    def test_real_worker_traceback_still_prints(self, bulk_runner, capsys):
+        """Guard for #334: the anchor is Glue's reporter, not the frames. An unexpected
+        worker failure prints its traceback through the same path and must survive."""
+        ev = _make_event(message=(
+            "A worker failed in a way we did not expect. Traceback from the worker:\n"
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/python_modules.zip/python_modules/fill/__init__.py", line 159\n'
+            "RuntimeError: faker did something silly\n"
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        combined = capsys.readouterr()
+        assert 'faker did something silly' in (combined.out + combined.err)
+
+    def test_driver_side_denial_stack_still_prints(self, bulk_runner, capsys):
+        """Guard for #334: anchoring on the frames instead of the reporter would have
+        swallowed this. Verbatim shape from a denied `count` (issue #332): the message the
+        user needs is wrapped in Spark frames that look exactly like the noise."""
+        ev = _make_event(message=(
+            "py4j.protocol.Py4JJavaError: An error occurred while calling o304.load.\n"
+            ": software.amazon.awssdk.services.dynamodb.model.DynamoDbException: User: "
+            "arn:aws:sts::1:assumed-role/Role/Session is not authorized to perform: "
+            "dynamodb:Scan\n"
+            "\tat org.apache.spark.sql.execution.datasources.v2.DataSourceV2Utils$."
+            "getTableFromProvider(DataSourceV2Utils.scala:105)\n"
+            "\tat org.apache.spark.sql.execution.datasources.v2.DataSourceV2Utils$."
+            "loadV2Source(DataSourceV2Utils.scala:157)\n"
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert 'not authorized to perform' in combined or 'o304.load' in combined, \
+            "a denial arriving inside Spark frames must still reach the user"
+
+    def test_concurrent_modification_from_elsewhere_still_prints(self, bulk_runner, capsys):
+        """Guard for #334: anchoring on the exception type would hide a real one. Only
+        Glue's reporter announcing its own suppressed failure is noise."""
+        ev = _make_event(message=(
+            "2026-09-01 04:33:39 ERROR SomethingOfOurs:12 - write failed\n"
+            "java.util.ConcurrentModificationException: null\n"
+            "\tat java.base/java.util.ArrayList.sort(ArrayList.java:1723) ~[?:?]\n"
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        assert 'ConcurrentModificationException' in captured.out + captured.err
+
+    def test_real_stage_failure_still_prints(self, bulk_runner, capsys):
+        """Guard for #292: suppressing the echoed regex must not shadow a
+        genuine Spark stage failure, which carries the same wording.
+
+        The ignore-list anchor is the SyntaxWarning text, not the stage-failure
+        text, so a real failure is unaffected. This test exists because anchoring
+        on "Job aborted due to stage failure" would have been the tempting fix
+        and would have silently hidden real errors.
+        """
+        ev = _make_event(message=(
+            "2026-08-26 18:30:37 ERROR GlueExceptionAnalysisListener:9 - "
+            "Job aborted due to stage failure: Task 3 in stage 2.0 failed 4 times"
+        ))
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        assert 'Job aborted due to stage failure' in (captured.out + captured.err)
+
+    def test_warning_merged_with_info_still_colors_yellow(self, bulk_runner, capsys):
+        """Regression: a WARNING delivered in the same event as a preceding INFO
+        line (internal newline, INFO has no timestamp prefix) must still color
+        yellow. The reassembler splits on the record boundary so the WARNING is
+        evaluated on its own rather than as a continuation of the INFO line."""
+        info_line = '[before] Max read rate set to specified limit: 20'
+        warn_line = ('2026-08-04 08:08:15,393 WARNING [MainThread] root - '
+                     '[before] Read rate 20 less than recommended value of 100.')
+        merged = _make_event(
+            message=f'{info_line}\n{warn_line}\n',
+            log_group='123456789012:/aws-glue/jobs/output',
+        )
+        # Drive the real reassembler → tailer path.
+        # reorder window of 0 so the event is released immediately (#323 renamed
+        # this knob; the old buffer_time_ms compared against event timestamps).
+        reassembler = runner_module.GlueLogReassembler(reorder_window_ms=0)
+        for ev in reassembler.process([merged]):
+            bulk_runner._pretty_print_log_event(ev)
+        for ev in reassembler.flush():
+            bulk_runner._pretty_print_log_event(ev)
+
+        out = capsys.readouterr().out
+        warn_pos = out.find('WARNING')
+        assert warn_pos != -1, "WARNING line should have been printed"
+        # The WARNING segment carries a YELLOW code; the INFO segment before it
+        # does not (it is not a recognized level, so it stays uncolored).
+        assert runner_module.ColorCodes.YELLOW in out[:warn_pos]
+        assert runner_module.ColorCodes.YELLOW not in out[:out.find(info_line) + len(info_line)]
+
     def test_bulk_executor_error_sets_suppress_flag(self, bulk_runner, monkeypatch):
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         ev = _make_event(message='BulkExecutorError fatal')
         bulk_runner._pretty_print_log_event(ev)
         assert bulk_runner._suppress_glue_noise is True
+
+    def test_worker_traceback_banner_sets_suppress_flag(self, bulk_runner, monkeypatch):
+        """An unexpected worker failure explains itself with the worker's traceback, so
+        Glue's analysis of our own plumbing adds nothing after it."""
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+        ev = _make_event(
+            message='A worker failed in a way we did not expect. Traceback from the worker:')
+        bulk_runner._pretty_print_log_event(ev)
+        assert bulk_runner._suppress_glue_noise is True
+
+    def test_ordinary_message_does_not_set_suppress_flag(self, bulk_runner, monkeypatch):
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+        bulk_runner._pretty_print_log_event(_make_event(message='Total records filled: 30'))
+        assert bulk_runner._suppress_glue_noise is False
 
     def test_glue_exception_listener_suppressed_after_bulk_error(self, bulk_runner, capsys, monkeypatch):
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         bulk_runner._suppress_glue_noise = True
         ev = _make_event(message='GlueExceptionAnalysisListener spam')
         bulk_runner._pretty_print_log_event(ev)
@@ -292,7 +777,6 @@ class TestPrettyPrintLogEvent:
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         bulk_runner._suppress_glue_noise = True
         ev = _make_event(message='Error Category: foo')
         bulk_runner._pretty_print_log_event(ev)
@@ -302,7 +786,6 @@ class TestPrettyPrintLogEvent:
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         ev = _make_event(
             message='hello world',
             log_group='123456789012:/aws-glue/jobs/output',
@@ -316,7 +799,6 @@ class TestPrettyPrintLogEvent:
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         ev = _make_event(
             message='something',
             log_group='123456789012:/aws-glue/jobs/somewhere-else',
@@ -329,7 +811,6 @@ class TestPrettyPrintLogEvent:
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', ['arguments:'])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         ev = _make_event(
             message='arguments: foo',
             log_group='123456789012:/aws-glue/jobs/output',
@@ -343,7 +824,6 @@ class TestPrettyPrintLogEvent:
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', ['exception'])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         ev = _make_event(
             message='java exception thrown',
             log_group='123456789012:/aws-glue/jobs/output',
@@ -353,24 +833,93 @@ class TestPrettyPrintLogEvent:
         # Output goes to stderr (PINK).
         assert runner_module.ColorCodes.PINK in captured.err
 
-    def test_warn_keys_route_to_yellow(self, bulk_runner, capsys, monkeypatch):
+    def test_warning_level_routes_to_yellow(self, bulk_runner, capsys, monkeypatch):
+        # A real server WARNING line (identified by its leading "<asctime> WARNING"
+        # prefix) is yellow regardless of its body.
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [' warn '])
         ev = _make_event(
-            message=' WARN something',
+            message='2026-08-04 04:41:33,623 WARNING [MainThread] root - [t] too slow',
             log_group='123456789012:/aws-glue/jobs/output',
         )
         bulk_runner._pretty_print_log_event(ev)
         out = capsys.readouterr().out
         assert runner_module.ColorCodes.YELLOW in out
 
+    def test_error_level_routes_to_pink_stderr(self, bulk_runner, capsys, monkeypatch):
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+        ev = _make_event(
+            message='2026-08-04 04:41:33,623 ERROR [MainThread] root - boom',
+            log_group='123456789012:/aws-glue/jobs/output',
+        )
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        assert runner_module.ColorCodes.PINK in captured.err
+
+    def test_critical_level_routes_to_pink_stderr(self, bulk_runner, capsys, monkeypatch):
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+        ev = _make_event(
+            message='2026-08-04 04:41:33,623 CRITICAL [MainThread] root - fatal',
+            log_group='123456789012:/aws-glue/jobs/output',
+        )
+        bulk_runner._pretty_print_log_event(ev)
+        assert runner_module.ColorCodes.PINK in capsys.readouterr().err
+
+    def test_warning_with_error_keyword_in_body_is_yellow_not_red(self, bulk_runner, capsys, monkeypatch):
+        # The core bug (#252): the timeout WARNING contains the word "timeout",
+        # which is a STD_ERROR keyword. Level-anchoring must win so it stays yellow
+        # on stdout rather than red on stderr.
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', ['timeout', 'exception'])
+        ev = _make_event(
+            message='2026-08-04 05:28:27,649 WARNING [MainThread] root - '
+                    '[t] ...exceeds the ~60 min remaining before the job timeout...',
+            log_group='123456789012:/aws-glue/jobs/output',
+        )
+        bulk_runner._pretty_print_log_event(ev)
+        captured = capsys.readouterr()
+        assert runner_module.ColorCodes.YELLOW in captured.out
+        assert captured.err == ''
+
+    def test_config_keys_win_over_level(self, bulk_runner, capsys, monkeypatch):
+        # CONFIG (gray) is checked before the level so WARNING-level external-lib
+        # noise stays de-emphasized rather than turning yellow.
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', ['timeout='])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
+        ev = _make_event(
+            message='2026-08-04 04:41:33,623 WARNING [MainThread] botocore - Connection timeout=30',
+            log_group='123456789012:/aws-glue/jobs/output',
+        )
+        bulk_runner._pretty_print_log_event(ev)
+        out = capsys.readouterr().out
+        assert runner_module.ColorCodes.GRAY in out
+        assert runner_module.ColorCodes.YELLOW not in out
+
+    def test_keyword_fallback_for_lines_without_level_prefix(self, bulk_runner, capsys, monkeypatch):
+        # Foreign lines (e.g. Spark/log4j with a different timestamp format) don't
+        # match our level prefix, so the keyword fallback still colors them.
+        monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
+        monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
+        monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', ['exception'])
+        ev = _make_event(
+            message='2026-08-04 04:17:36 ERROR TransportRequestHandler exception',
+            log_group='123456789012:/aws-glue/jobs/output',
+        )
+        bulk_runner._pretty_print_log_event(ev)
+        # No comma-millis → no level match → falls to keyword branch (pink/stderr).
+        assert runner_module.ColorCodes.PINK in capsys.readouterr().err
+
     def test_default_path_no_color(self, bulk_runner, capsys, monkeypatch):
         monkeypatch.setattr(runner_module.utils, 'LOG_PATTERN_IGNORE_LIST', [])
         monkeypatch.setattr(runner_module.utils, 'CONFIG_LOG_MESSAGE_KEYS', [])
         monkeypatch.setattr(runner_module.utils, 'STD_ERROR_MESSAGE_KEYS', [])
-        monkeypatch.setattr(runner_module.utils, 'WARN_LOG_MESSAGE_KEYS', [])
         ev = _make_event(
             message='regular message',
             log_group='123456789012:/aws-glue/jobs/output',
@@ -383,26 +932,52 @@ class TestPrettyPrintLogEvent:
         assert runner_module.ColorCodes.YELLOW not in out
 
 
-# --- _is_job_state_unhealthy ------------------------------------------------
+# --- _unhealthy_signal ------------------------------------------------------
 
 
-class TestIsJobStateUnhealthy:
-    """Tests for unhealthy state detection (lines 137-144)."""
+def _signal(pattern='BadThing:', summary='the thing went bad', advice='try the other thing'):
+    return utils.UnhealthySignal(pattern, summary, advice)
 
-    def test_returns_true_when_unhealthy_keyword_present(self, bulk_runner, monkeypatch):
-        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_MESSAGE_KEYS',
-                            ['BadThing:'])
+
+class TestUnhealthySignal:
+    """Tests for unhealthy state detection."""
+
+    def test_returns_the_matching_signal(self, bulk_runner, monkeypatch):
+        signal = _signal()
+        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_SIGNALS', [signal])
         ev = {'message': 'oh no BadThing: detected'}
-        assert bulk_runner._is_job_state_unhealthy(ev) is True
+        assert bulk_runner._unhealthy_signal(ev) is signal
 
-    def test_returns_false_when_no_unhealthy_keyword(self, bulk_runner, monkeypatch):
-        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_MESSAGE_KEYS',
-                            ['BadThing:'])
+    def test_returns_none_when_no_signal_matches(self, bulk_runner, monkeypatch):
+        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_SIGNALS', [_signal()])
         ev = {'message': 'totally fine'}
-        assert bulk_runner._is_job_state_unhealthy(ev) is False
+        assert bulk_runner._unhealthy_signal(ev) is None
 
+    def test_returns_the_first_of_several_matches(self, bulk_runner, monkeypatch):
+        """Order is the tie-break, so the caller gets one summary rather than a pile."""
+        first, second = _signal('A:', 'first'), _signal('B:', 'second')
+        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_SIGNALS', [first, second])
+        assert bulk_runner._unhealthy_signal({'message': 'B: and A: both'}) is first
 
-# --- _wait_for_log_groups_to_exist ------------------------------------------
+    def test_every_shipped_signal_carries_a_summary_and_advice(self):
+        """The point of the list: a stop nobody explained is the bug this replaced."""
+        for signal in utils.UNHEALTHY_STATE_LOG_SIGNALS:
+            assert signal.pattern
+            assert signal.summary and not signal.summary.endswith('.'), \
+                f"{signal.pattern}: summary completes 'Job failed: <summary>.'"
+            assert signal.advice and signal.advice.endswith('.'), \
+                f"{signal.pattern}: advice is prose, and prints on its own line"
+
+    def test_out_of_memory_is_one_of_them(self):
+        """Guard on the pattern itself: it is what the JVM prints, and the whole
+        memory story hangs off matching it."""
+        memory = [s for s in utils.UNHEALTHY_STATE_LOG_SIGNALS
+                  if s.pattern == 'OutOfMemoryError:']
+        assert len(memory) == 1
+        assert memory[0].advice is utils.MEMORY_ADVICE
+        assert 'java.lang.OutOfMemoryError: Java heap space'.find(memory[0].pattern) != -1, \
+            "must match the JVM's own wording, as captured from a Glue executor log"
+
 
 
 class TestWaitForLogGroupsToExist:
@@ -468,6 +1043,69 @@ class TestWatchLogGroup:
     def _arn(self):
         return 'arn:aws:logs:us-east-1:123456789012:log-group:/aws-glue/jobs/output'
 
+    def _error_arn(self):
+        return 'arn:aws:logs:us-east-1:123456789012:log-group:/aws-glue/jobs/error'
+
+    def test_both_groups_subscribe_by_prefix(self, bulk_runner):
+        """Both groups subscribe by stream-name prefix (not exact name): an exact
+        subscription would fail with ResourceNotFoundException because the driver
+        stream doesn't exist yet when the tail starts."""
+        import threading
+        for arn in (self._arn(), self._error_arn()):
+            bulk_runner.logs_client.start_live_tail.reset_mock()
+            unhealthy = threading.Event()
+            bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+            event_stream = MagicMock()
+            event_stream.__iter__ = MagicMock(return_value=iter([]))
+            bulk_runner.logs_client.start_live_tail.return_value = {'responseStream': event_stream}
+
+            bulk_runner._watch_log_group('jr-xyz', arn, unhealthy)
+
+            kwargs = bulk_runner.logs_client.start_live_tail.call_args.kwargs
+            assert kwargs['logStreamNamePrefixes'] == ['jr-xyz']
+            assert 'logStreamNames' not in kwargs
+
+    def test_executor_events_bypass_reassembler_but_are_health_checked(self, bulk_runner, monkeypatch):
+        """The routing: driver events go to the reassembler and are printed;
+        executor ("_g-") events skip the reassembler entirely (so they can't be
+        merged onto a driver line -- issue #284) and are never printed, but they
+        still pass through the health check and can trigger shutdown."""
+        import threading
+        unhealthy = threading.Event()
+        bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+        bulk_runner._get_job_run_state = MagicMock(return_value=runner_module.RUNNING_STATE)
+        bulk_runner._stop_glue_job = MagicMock()
+        printed = []
+        bulk_runner._pretty_print_log_event = MagicMock(side_effect=printed.append)
+        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_SIGNALS',
+                            [_signal('OutOfMemoryError', 'the job ran out of memory')])
+
+        driver_ev = {'logStreamName': 'jr-xyz', 'message': 'diff line\n', 'timestamp': 1}
+        exec_ev = {'logStreamName': 'jr-xyz_g-abc123', 'message': 'OutOfMemoryError\n', 'timestamp': 2}
+
+        with patch.object(runner_module, 'GlueLogReassembler') as reasm_cls:
+            reasm = MagicMock()
+            reasm.process.side_effect = lambda events: list(events)  # echo what it's fed
+            reasm.flush.return_value = []
+            reasm_cls.return_value = reasm
+            event_stream = MagicMock()
+            event_stream.__iter__ = MagicMock(return_value=iter([
+                {'sessionUpdate': {'sessionResults': [driver_ev, exec_ev]}},
+            ]))
+            bulk_runner.logs_client.start_live_tail.return_value = {'responseStream': event_stream}
+
+            bulk_runner._watch_log_group('jr-xyz', self._arn(), unhealthy)
+
+        # Reassembler saw ONLY the driver event; the executor event bypassed it.
+        fed = reasm.process.call_args_list[0].args[0]
+        assert driver_ev in fed
+        assert exec_ev not in fed
+        # Only the driver event was printed.
+        assert printed == [driver_ev]
+        # The executor fatal signal still triggered shutdown.
+        assert unhealthy.is_set()
+        bulk_runner._stop_glue_job.assert_called_once_with('jr-xyz')
+
     def test_terminal_state_exits_event_loop(self, bulk_runner, monkeypatch):
         """Job in TERMINAL_JOB_STATES → close stream and return."""
         import threading
@@ -501,15 +1139,15 @@ class TestWatchLogGroup:
         bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
         event_stream.close.assert_called_once()
 
-    def test_session_update_with_unhealthy_log_stops_job(self, bulk_runner, monkeypatch):
+    def test_session_update_with_unhealthy_log_stops_job(self, bulk_runner, monkeypatch, caplog):
         import threading
         unhealthy = threading.Event()
         bulk_runner._wait_for_log_groups_to_exist = MagicMock()
         bulk_runner._get_job_run_state = MagicMock(return_value=runner_module.RUNNING_STATE)
         bulk_runner._stop_glue_job = MagicMock()
 
-        # Force is_job_state_unhealthy to return True for our event.
-        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_MESSAGE_KEYS', ['BadThing:'])
+        # Force the health check to match our event.
+        monkeypatch.setattr(runner_module.utils, 'UNHEALTHY_STATE_LOG_SIGNALS', [_signal()])
         # Make pretty_print_log_event a no-op to isolate this branch.
         bulk_runner._pretty_print_log_event = MagicMock()
 
@@ -535,10 +1173,19 @@ class TestWatchLogGroup:
                 'responseStream': event_stream
             }
 
-            bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+            with caplog.at_level(logging.ERROR):
+                bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
 
         assert unhealthy.is_set()
         bulk_runner._stop_glue_job.assert_called_once_with('jr-1')
+
+        # Stopping without saying why is the bug this replaced: the matched line is on a
+        # stream we never print, and a stopped run carries no ErrorMessage of its own, so
+        # these two lines are the only account the user gets.
+        assert 'Stopping the job: the thing went bad.' in caplog.text
+        assert 'try the other thing' in caplog.text, 'the advice, at detection'
+        # Kept for the closing line, which is written after the watcher threads are done.
+        assert bulk_runner._unhealthy_signal_seen.summary == 'the thing went bad'
 
     def test_unknown_event_type_raises_runtime_error(self, bulk_runner, monkeypatch):
         """Lines 239-240: Unknown event raises RuntimeError, caught by generic handler."""
@@ -592,6 +1239,163 @@ class TestWatchLogGroup:
 
         bulk_runner.logs_client.start_live_tail.side_effect = HTTPClientError(error='boom')
         bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+        assert bulk_runner.logs_client.start_live_tail.call_count == 1
+
+    def _raising_stream(self, exc):
+        """An event stream whose iteration raises `exc` mid-tail.
+
+        This mirrors the real failure: the timeout/drop happens while reading
+        from the live-tail stream (inside `for event in event_stream`), not at
+        start_live_tail time, so the raw urllib3 error escapes botocore's
+        request layer.
+        """
+        def _gen():
+            raise exc
+            yield  # pragma: no cover - makes this a generator
+        stream = MagicMock()
+        stream.__iter__ = MagicMock(return_value=_gen())
+        return stream
+
+    def test_read_timeout_mid_stream_reconnects_when_job_running(self, bulk_runner, monkeypatch):
+        """Regression: a raw urllib3 ReadTimeoutError during tail must reconnect,
+        not fall into the generic handler that kills the watcher thread and
+        silently drops the rest of the job's output (PR #243 / issue #131)."""
+        import threading
+        unhealthy = threading.Event()
+        bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+        # RUNNING at raise time → reconnect; SUCCEEDED on the retry → clean exit.
+        bulk_runner._get_job_run_state = MagicMock(side_effect=[
+            runner_module.RUNNING_STATE,
+            runner_module.SUCCEEDED_STATE,
+        ])
+        monkeypatch.setattr(runner_module.time, 'sleep', lambda s: None)
+
+        read_timeout = ReadTimeoutError(
+            MagicMock(), 'https://stream-logs.eu-south-2.amazonaws.com', 'Read timed out.'
+        )
+        bulk_runner.logs_client.start_live_tail.side_effect = [
+            {'responseStream': self._raising_stream(read_timeout)},
+            {'responseStream': MagicMock(__iter__=MagicMock(return_value=iter([])))},
+        ]
+        with patch.object(runner_module, 'GlueLogReassembler') as reasm_cls:
+            reasm = MagicMock()
+            reasm.process.return_value = []
+            reasm.flush.return_value = []
+            reasm_cls.return_value = reasm
+
+            bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+
+        # Reconnected rather than dying on the first timeout.
+        assert bulk_runner.logs_client.start_live_tail.call_count == 2
+
+    def test_protocol_error_mid_stream_reconnects_when_job_running(self, bulk_runner, monkeypatch):
+        """A dropped connection (urllib3 ProtocolError) mid-tail also reconnects."""
+        import threading
+        unhealthy = threading.Event()
+        bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+        bulk_runner._get_job_run_state = MagicMock(side_effect=[
+            runner_module.RUNNING_STATE,
+            runner_module.SUCCEEDED_STATE,
+        ])
+        monkeypatch.setattr(runner_module.time, 'sleep', lambda s: None)
+
+        bulk_runner.logs_client.start_live_tail.side_effect = [
+            {'responseStream': self._raising_stream(ProtocolError('Connection broken'))},
+            {'responseStream': MagicMock(__iter__=MagicMock(return_value=iter([])))},
+        ]
+        with patch.object(runner_module, 'GlueLogReassembler') as reasm_cls:
+            reasm = MagicMock()
+            reasm.process.return_value = []
+            reasm.flush.return_value = []
+            reasm_cls.return_value = reasm
+
+            bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+
+        assert bulk_runner.logs_client.start_live_tail.call_count == 2
+
+    def test_read_timeout_returns_when_terminal(self, bulk_runner, monkeypatch):
+        """A read timeout after the job already reached a terminal state returns
+        without reconnecting."""
+        import threading
+        unhealthy = threading.Event()
+        bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+        bulk_runner._get_job_run_state = MagicMock(return_value=runner_module.FAILED_STATE)
+
+        read_timeout = ReadTimeoutError(MagicMock(), 'https://x', 'Read timed out.')
+        bulk_runner.logs_client.start_live_tail.side_effect = read_timeout
+        bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+        assert bulk_runner.logs_client.start_live_tail.call_count == 1
+
+    def test_reconnect_warns_that_the_gap_may_have_lost_output(self, bulk_runner, monkeypatch, caplog):
+        """A dropped session is a hole in the output, so say so.
+
+        Live Tail delivers only what is ingested while a session is open and never
+        backfills, so every line CloudWatch ingested between the drop and the new
+        session is gone from the console. This used to be log.debug -- invisible
+        unless the user passed --XDebug -- which meant a truncated run looked
+        exactly like a complete one, since the job still reports success.
+        """
+        import logging
+        import threading
+        unhealthy = threading.Event()
+        bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+        bulk_runner._get_job_run_state = MagicMock(side_effect=[
+            runner_module.RUNNING_STATE,        # still running -> reconnect
+            runner_module.SUCCEEDED_STATE,      # done on the retry -> clean exit
+        ])
+        monkeypatch.setattr(runner_module.time, 'sleep', lambda s: None)
+        bulk_runner.logs_client.start_live_tail.side_effect = [
+            {'responseStream': self._raising_stream(ProtocolError('Connection broken'))},
+            {'responseStream': MagicMock(__iter__=MagicMock(return_value=iter([])))},
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "a reconnect gap must be visible without --XDebug"
+        assert any('reconnecting' in w for w in warnings)
+        assert any('missing' in w for w in warnings), "say output may be lost"
+        assert any('CloudWatch Logs' in w for w in warnings), "point somewhere useful"
+        # Still reconnects -- the warning must not change the recovery behavior.
+        assert bulk_runner.logs_client.start_live_tail.call_count == 2
+
+    def test_drop_after_job_finished_flushes_and_warns(self, bulk_runner, caplog):
+        """The give-up path used to drop buffered output silently.
+
+        When the stream dies and the job has already finished there is nothing to
+        reconnect for, but the session ended abnormally: whatever the reassembler
+        was still holding was discarded with no message at all. This is the shape
+        that fits the e2e failure that started this work -- a `Wrote ... to s3://`
+        line lost while the command reported success.
+        """
+        import logging
+        import threading
+        unhealthy = threading.Event()
+        bulk_runner._wait_for_log_groups_to_exist = MagicMock()
+        bulk_runner._get_job_run_state = MagicMock(return_value=runner_module.SUCCEEDED_STATE)
+        printed = []
+        bulk_runner._pretty_print_log_event = MagicMock(side_effect=printed.append)
+
+        dangling = {'message': 'Wrote 100 rows in JSON format to s3://bucket/out',
+                    'timestamp': 1, 'logStreamName': 'jr-1',
+                    'logGroupIdentifier': '123456789012:/aws-glue/jobs/output'}
+        with patch.object(runner_module, 'GlueLogReassembler') as reasm_cls:
+            reasm = MagicMock()
+            reasm.process.return_value = []
+            reasm.flush.return_value = [dangling]   # buffered when the stream died
+            reasm_cls.return_value = reasm
+            bulk_runner.logs_client.start_live_tail.side_effect = [
+                {'responseStream': self._raising_stream(ReadTimeoutError(MagicMock(), 'https://x', 'timed out'))},
+            ]
+            with caplog.at_level(logging.WARNING):
+                bulk_runner._watch_log_group('jr-1', self._arn(), unhealthy)
+
+        # The buffered line reaches the user instead of vanishing.
+        assert printed == [dangling]
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('not yet delivered is' in w for w in warnings), warnings
+        # Did not try to reconnect -- the job was already done.
         assert bulk_runner.logs_client.start_live_tail.call_count == 1
 
     def test_generic_exception_returns(self, bulk_runner):
@@ -929,6 +1733,31 @@ class TestStartGlueJob:
         with pytest.raises(SystemExit):
             bulk_runner._start_glue_job({}, {})
 
+    def test_expired_token_message_is_not_swallowed_by_the_else(self, bulk_runner):
+        """#298 recorded this as a bug; it never was. Pin it either way.
+
+        AGENTS.md claimed the second `if` should be an `elif` because "else fires
+        on ExpiredTokenException too". It doesn't: exit() raises SystemExit, so
+        the first branch terminates before the second is evaluated. The shape has
+        been changed to if/elif/else for legibility, and this asserts the message
+        each error code actually produces -- so a future edit that turns an
+        exit() into a log call (which WOULD create the bug) fails here.
+        """
+        cases = {
+            'ExpiredTokenException': 'ExpiredTokenException',
+            'EntityNotFoundException': 'perhaps you need to run bootstrap',
+            'SomeOtherCode': 'Unhandled Exception',
+        }
+        for code, expected in cases.items():
+            bulk_runner.glue_client.start_job_run.side_effect = ClientError(
+                {'Error': {'Code': code, 'Message': 'm'}}, 'StartJobRun',
+            )
+            with pytest.raises(SystemExit) as exc:
+                bulk_runner._start_glue_job({}, {})
+            assert expected in str(exc.value), (
+                f"{code} produced the wrong message: {exc.value}"
+            )
+
     def test_entity_not_found_exception_exits(self, bulk_runner):
         err = ClientError(
             {'Error': {'Code': 'EntityNotFoundException', 'Message': 'no job'}},
@@ -1076,6 +1905,10 @@ def _wire_run_dependencies(bulk_runner, *, final_state, error_message=None,
 class TestRunStateBranches:
     """Tests for end-state messaging in run() (lines 466-477)."""
 
+    def _final_line_record(self, caplog):
+        """The closing 'Job ... Job duration:' line, whatever level it was logged at."""
+        return next(r for r in caplog.records if 'Job duration:' in r.getMessage())
+
     def test_succeeded_state(self, bulk_runner, caplog):
         _wire_run_dependencies(bulk_runner, final_state=runner_module.SUCCEEDED_STATE)
         import logging as _logging
@@ -1083,6 +1916,8 @@ class TestRunStateBranches:
             # A successful job must NOT raise SystemExit — it exits 0.
             bulk_runner.run({}, [])
         assert any('completed successfully' in m for m in caplog.messages)
+        # Success stays plain INFO.
+        assert self._final_line_record(caplog).levelname == 'INFO'
 
     def test_stopping_state(self, bulk_runner, caplog):
         _wire_run_dependencies(bulk_runner, final_state=runner_module.STOPPING_STATE)
@@ -1093,6 +1928,8 @@ class TestRunStateBranches:
                 bulk_runner.run({}, [])
         assert exc.value.code == 1
         assert any('stopping' in m for m in caplog.messages)
+        # A user-interrupted stop is a warning (yellow), not an error.
+        assert self._final_line_record(caplog).levelname == 'WARNING'
 
     def test_stopped_state(self, bulk_runner, caplog):
         _wire_run_dependencies(bulk_runner, final_state=runner_module.STOPPED_STATE)
@@ -1102,6 +1939,7 @@ class TestRunStateBranches:
                 bulk_runner.run({}, [])
         assert exc.value.code == 1
         assert any('stopped' in m for m in caplog.messages)
+        assert self._final_line_record(caplog).levelname == 'WARNING'
 
     def test_failed_state(self, bulk_runner, caplog):
         _wire_run_dependencies(bulk_runner, final_state=runner_module.FAILED_STATE)
@@ -1111,6 +1949,8 @@ class TestRunStateBranches:
                 bulk_runner.run({}, [])
         assert exc.value.code == 1
         assert any('failed' in m.lower() for m in caplog.messages)
+        # A genuine failure is an error (red).
+        assert self._final_line_record(caplog).levelname == 'ERROR'
 
     def test_timeout_state(self, bulk_runner, caplog):
         _wire_run_dependencies(bulk_runner, final_state=runner_module.TIMEOUT_STATE)
@@ -1120,6 +1960,7 @@ class TestRunStateBranches:
                 bulk_runner.run({}, [])
         assert exc.value.code == 1
         assert any('timed out' in m for m in caplog.messages)
+        assert self._final_line_record(caplog).levelname == 'ERROR'
 
     def test_unhandled_state_logs_error(self, bulk_runner, caplog):
         _wire_run_dependencies(bulk_runner, final_state='WEIRD_STATE')
@@ -1129,7 +1970,10 @@ class TestRunStateBranches:
             with pytest.raises(SystemExit) as exc:
                 bulk_runner.run({}, [])
         assert exc.value.code == 1
-        assert any('Unhandled Job State' in m for m in caplog.messages)
+        # The state name is surfaced in the closing line, logged at ERROR.
+        rec = self._final_line_record(caplog)
+        assert rec.levelname == 'ERROR'
+        assert 'WEIRD_STATE' in rec.getMessage()
 
     def test_starts_job_with_arguments(self, bulk_runner):
         _wire_run_dependencies(bulk_runner, final_state=runner_module.SUCCEEDED_STATE)

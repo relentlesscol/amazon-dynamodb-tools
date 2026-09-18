@@ -3,8 +3,10 @@
 Covers `python_modules/fill/__init__.py`:
 - print_dynamodb_table_info: cost arithmetic, billing mode branches (PROVISIONED
   vs PAY_PER_REQUEST vs implicit else), helper call wiring
+- _as_item_collection: single-dict vs list vs lazy-iterator normalization
 - check_generator_output_avg_size: item serialization and averaging across
-  10 generator invocations
+  10 generator invocations, for each generator return shape (bare dict,
+  list of dicts, generator object)
 - run(): argument wiring (table, numitems defaults, generator selection,
   importlib dynamic load), parallelization math (items_per_worker distribution),
   spark accumulator setup, rate-limiter config, error propagation,
@@ -254,6 +256,67 @@ class TestCheckGeneratorOutputAvgSize:
 
         # 10 calls * 2 items = 20 items, each 50 bytes → avg = 50
         assert result == 50.0
+
+    def test_generate_returning_bare_dict_measures_the_item_not_its_keys(self):
+        """A generator returning one item as a dict is measured as the item.
+
+        Iterating a dict yields its keys, so without normalization this sizes
+        `{"S": "pk"}` and `{"S": "payload"}` instead of the item -- the ~17x
+        under-report in #344. Deliberately does not mock json.dumps: the whole
+        point is the real serialized byte count.
+        """
+        item = {'pk': 'a', 'payload': 'x' * 200}
+        generate = MagicMock(return_value=item)
+
+        result = fill_module.check_generator_output_avg_size(generate)
+
+        assert generate.call_count == 10, "generate still called 10 times"
+        # One item per call → 10 items, not 20 attribute names.
+        assert result > 200, \
+            f"should measure the ~200-byte item, not its attribute names (got {result})"
+
+    def test_generate_returning_bare_dict_matches_same_item_in_a_list(self):
+        """Both supported shapes report the same average for the same item.
+
+        Pins the fix at the level that matters: `nosk` (bare dict) and `default`
+        (list of dicts) must not disagree about the size of an identical item.
+        """
+        item = {'pk': 'a', 'payload': 'x' * 200}
+
+        as_dict = fill_module.check_generator_output_avg_size(MagicMock(return_value=item))
+        as_list = fill_module.check_generator_output_avg_size(MagicMock(return_value=[item]))
+
+        assert as_dict == as_list, \
+            f"dict shape {as_dict} should equal list shape {as_list}"
+
+    def test_generator_yielding_items_is_measured_per_item(self):
+        """A generator function returning an iterator needs no normalization.
+
+        Guards against a fix that assumes list-or-dict and breaks the lazy shape:
+        iterating a generator object already yields items.
+        """
+        item = {'pk': 'a', 'payload': 'x' * 200}
+        generate = MagicMock(side_effect=lambda: (i for i in [item, item]))
+
+        result = fill_module.check_generator_output_avg_size(generate)
+
+        as_list = fill_module.check_generator_output_avg_size(MagicMock(return_value=[item]))
+        assert result == as_list, "generator shape should measure the same as a list"
+
+    def test_shipped_nosk_generator_is_sized_realistically(self):
+        """The concrete case from #344: `nosk` reported 15 B for a ~251 B item.
+
+        Runs the real shipped generator through the real estimator -- no mocks --
+        because the bug was invisible to every mocked test.
+        """
+        from python_modules.fill import nosk
+
+        result = fill_module.check_generator_output_avg_size(nosk.generate)
+
+        # nosk emits a 200-char payload plus a ~10-digit Decimal pknum; the
+        # serialized JSON lands around 250 bytes. The bug reported ~15.
+        assert 200 < result < 350, \
+            f"nosk's ~250-byte item should be sized in that ballpark (got {result})"
 
 
 # --- run() ------------------------------------------------------------------
@@ -888,8 +951,10 @@ class TestFillDataErrorHandling:
         error_acc.add.assert_called_once()
         msg = error_acc.add.call_args.args[0]
         assert isinstance(msg, list) and len(msg) == 1
-        assert 'Schema validation error' in msg[0]
-        assert "ValidationException happened" in msg[0]
+        message, detail = msg[0]
+        assert 'Schema validation error' in message
+        assert "ValidationException happened" in message
+        assert detail is None, "a validation rejection needs no traceback"
 
     def test_other_client_error_adds_generic_error(self, monkeypatch):
         """Lines 174-175: non-throttle, non-validation → generic error message."""
@@ -916,7 +981,7 @@ class TestFillDataErrorHandling:
 
         error_acc.add.assert_called_once()
         msg = error_acc.add.call_args.args[0]
-        assert 'Error during writing' in msg[0]
+        assert 'Error during writing' in msg[0][0]
 
     def test_rate_limiter_shutdown_in_finally(self, monkeypatch):
         """Lines 176-177: rate_limiter_worker.shutdown() always called."""
@@ -1073,3 +1138,85 @@ class TestModuleConstants:
     def test_validation_exception_constant(self):
         """Line 28: DYNAMO_DB_VALIDATION_EXCEPTION."""
         assert fill_module.DYNAMO_DB_VALIDATION_EXCEPTION == 'ValidationException'
+
+
+class TestFillWorkerRecordsNonClientErrors:
+    """A worker must not let a non-ClientError escape (issue #327), and what it
+    records depends on whether the failure is one we can explain.
+
+    A generated item that doesn't carry the table's key attributes is the common
+    case -- boto3 raises a bare KeyError from batch_writer's de-duplication, which
+    says nothing about what went wrong -- so it is detected before the write and
+    named. Anything else a user's generator raises gets its traceback.
+    """
+
+    def _wire(self, monkeypatch):
+        rl_instance = MagicMock()
+        session = MagicMock()
+        rl_instance.get_session.return_value = session
+        table = MagicMock()
+        bw = MagicMock()
+        bw.__enter__ = MagicMock(return_value=bw)
+        bw.__exit__ = MagicMock(return_value=False)
+        table.batch_writer.return_value = bw
+        session.resource.return_value.Table.return_value = table
+        monkeypatch.setattr(fill_module, 'RateLimiterWorker', MagicMock(return_value=rl_instance))
+        return rl_instance, bw
+
+    def test_item_missing_a_key_attribute_is_reported_politely(self, monkeypatch):
+        """A generator that doesn't match the key schema is an ordinary mistake, so
+        name what is missing rather than dumping boto3's bare KeyError."""
+        rl_instance, bw = self._wire(monkeypatch)
+        errors = []
+        error_acc = MagicMock()
+        error_acc.add = MagicMock(side_effect=errors.extend)
+
+        # Must not raise.
+        fill_module._fill_data({}, 'tbl', 1,
+                               MagicMock(return_value=[{'wrongkey': 'x', 'payload': 'y'}]),
+                               MagicMock(), error_acc, MagicMock(), ['pk'])
+
+        assert len(errors) == 1, f"expected one recorded error, got {errors}"
+        message, detail = errors[0]
+        assert "missing the table's key attribute(s) ['pk']" in message
+        assert "the item has ['payload', 'wrongkey']" in message, "say what it did produce"
+        assert "'tbl'" in message, "name the table whose schema it has to match"
+        assert detail is None, "an expected mistake needs no traceback"
+        bw.put_item.assert_not_called(), "don't write an item we know DynamoDB will reject"
+        rl_instance.shutdown.assert_called_once()
+
+    def test_generator_raising_is_reported_with_a_traceback(self, monkeypatch):
+        """Anything else out of a user's generator is not something we can explain."""
+        rl_instance, bw = self._wire(monkeypatch)
+        errors = []
+        error_acc = MagicMock()
+        error_acc.add = MagicMock(side_effect=errors.extend)
+
+        fill_module._fill_data({}, 'tbl', 1, MagicMock(side_effect=RuntimeError('faker blew up')),
+                               MagicMock(), error_acc, MagicMock(), ['pk'])
+
+        assert len(errors) == 1, f"expected one recorded error, got {errors}"
+        message, detail = errors[0]
+        assert 'Error in worker' in message
+        assert 'RuntimeError' in message, "the type, since a bare message can be cryptic"
+        assert 'Traceback' in detail
+        rl_instance.shutdown.assert_called_once()
+
+    def test_client_error_still_takes_the_specific_path(self, monkeypatch):
+        """The pre-existing ClientError handling must be unchanged."""
+        import botocore.exceptions
+        rl_instance, bw = self._wire(monkeypatch)
+        err = botocore.exceptions.ClientError(
+            {'Error': {'Code': 'ValidationException',
+                       'Message': 'The provided key element does not match the schema'}},
+            'BatchWriteItem')
+        bw.put_item = MagicMock(side_effect=err)
+        errors = []
+        error_acc = MagicMock()
+        error_acc.add = MagicMock(side_effect=errors.extend)
+
+        fill_module._fill_data({}, 'tbl', 1, MagicMock(return_value=[{'pk': 'x'}]),
+                               MagicMock(), error_acc, MagicMock(), ['pk'])
+
+        assert len(errors) == 1
+        assert 'Schema validation error' in errors[0][0], errors

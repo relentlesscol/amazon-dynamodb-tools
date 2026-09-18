@@ -11,6 +11,7 @@ from clients import Clients
 from infrastructure.verifier import is_existing_glue_job
 from utils import module_zipper
 from utils.logger import log
+from utils.role_validator import FATAL, validate_custom_role_permissions
 
 from __version__ import __version__ as VERSION
 
@@ -48,6 +49,20 @@ class BootstrapInfrastructure:
         self.glue_client = clients.glue_client
         self.logs_client = clients.logs_client
 
+        # Custom --XRole names whose permissions have already been validated
+        # this run. bootstrap() resolves the role name twice (_add_glue_job_role
+        # and _create_or_update_glue_job), and validation is now heavyweight
+        # (IAM reads + SimulatePrincipalPolicy). Without this, the reads fire
+        # twice and every WARNING is logged twice. See _get_role_name.
+        self._validated_custom_roles = set()
+
+        # Resources this run created, so a failed bootstrap can name what it
+        # left behind (issue #307). teardown locates resources through the Glue
+        # job, so if bootstrap dies before creating the job these are
+        # unreachable by the supported path -- saying so beats a silent leak.
+        self._role_created_this_run = None
+        self._bucket_created_this_run = None
+
     def _get_role_name(self, args):
         """
         Determine the appropriate role name based on the provided arguments.
@@ -66,6 +81,35 @@ class BootstrapInfrastructure:
             if not self._is_existing_role(role_param):
                 print(f"Provided --XRole '{role_param}' name does not exist!")
                 exit(1)
+            # Validate each custom role at most once per run. A FATAL finding
+            # exits below before the name is cached, so re-resolving after an
+            # eject can't happen; a role that only warned (or was clean) skips
+            # the second, redundant IAM read + SimulatePrincipalPolicy pass and
+            # avoids logging the same WARNINGs twice.
+            if role_param in self._validated_custom_roles:
+                return role_param
+            findings = validate_custom_role_permissions(self.iam_client, role_param)
+            # Surface every finding, then abort if any is FATAL. FATAL means the
+            # role provably cannot work (wrong name prefix, or a trust policy
+            # that won't let Glue assume it), so we eject here -- before any
+            # infrastructure is created -- rather than letting the operator hit
+            # an opaque Glue failure later. WARNINGs are advisory and never block.
+            fatal_found = False
+            for finding in findings:
+                if finding.severity == FATAL:
+                    log.error(finding.message)
+                    fatal_found = True
+                else:
+                    log.warning(finding.message)
+            if fatal_found:
+                print(
+                    f"Provided --XRole '{role_param}' cannot be used by the Glue "
+                    f"job (see the errors above). Aborting."
+                )
+                exit(1)
+            # Reached only when no finding was FATAL: record the role so the
+            # second resolution in this run doesn't re-validate or re-warn.
+            self._validated_custom_roles.add(role_param)
             return role_param
 
         # Handle standard role types
@@ -73,11 +117,30 @@ class BootstrapInfrastructure:
         role_id = READ_WRITE_ROLE_ID if is_write_access else READ_ONLY_ROLE_ID
         return f"{GLUE_JOB_ROOT_ROLE_NAME}-{role_id}-{self.aws_region}" # region definition for separate region specific permissioning
 
+    def _is_custom_role(self, args):
+        """True when the operator supplied their own role name via --XRole."""
+        role_param = args.get('XRole', '')
+        return bool(role_param) and role_param not in READ_WRITE_ROLE_TYPES
+
     def _add_glue_job_role(self, args):
+        """Use the role the operator gave us, or provision one of ours."""
         log.info("Adding Glue Job role...")
         self._prompt_for_role(args)
         role_name = self._get_role_name(args)
 
+        if self._is_custom_role(args):
+            # _get_role_name has already validated it; it is not ours to change.
+            log.info(f"Using custom Glue Job Role '{role_name}'")
+            return
+
+        self._provision_generated_role(role_name, args)
+
+    def _provision_generated_role(self, role_name, args):
+        """Create the role, or bring an existing one up to current needs.
+
+        Every call here is idempotent, so a generated role ends up matching what
+        this version expects after any bootstrap (#326).
+        """
         trust_policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -118,6 +181,27 @@ class BootstrapInfrastructure:
             ]
         }
 
+        # Read-only visibility into a table's autoscaling configuration so the
+        # job can tell whether autoscaling would lift a provisioned table's
+        # ceiling above a user-requested rate (issue #89). DescribeScalingPolicies
+        # is what supplies the target-utilization value in the autoscaling
+        # diagnostic; without it the whole diagnostic degrades (issue #297).
+        # Neither action supports resource-level scoping, so the resource must
+        # be "*".
+        autoscaling_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "application-autoscaling:DescribeScalableTargets",
+                        "application-autoscaling:DescribeScalingPolicies"
+                    ],
+                    "Resource": "*"
+                }
+            ]
+        }
+
         # Create the role
         try:
             response = self.iam_client.create_role(
@@ -127,14 +211,34 @@ class BootstrapInfrastructure:
 
             log.info(f"Bulk Executor Glue Job Role created: {role_name}")
             log.debug(f'Role ARN: {response["Role"]["Arn"]}')
+            self._role_created_this_run = role_name
         except self.iam_client.exceptions.EntityAlreadyExistsException as e:
             log.info(f"Found Bulk Executor Glue Job Role: {role_name}")
-            if not self._needs_role_refresh():
-                return
-            # The role already exists, so create_role (which sets the trust
-            # policy) was skipped. Re-apply the trust policy on refresh so the
-            # role ends up with the same AssumeRolePolicyDocument a fresh
-            # bootstrap would create, not the one baked in when it was first made.
+            log.debug(f"Applying the current policy set to {role_name}")
+            # Deliberately falls through to the policy work below: a
+            # bootstrap-generated role is brought up to what *this* version wants
+            # on every bootstrap, not only when __version__ changed.
+            #
+            # This used to be gated on _needs_role_refresh(), which compared the
+            # deployed Glue job's version against the local one. That answered "is
+            # the job stale?" when the question is "is this role provisioned the way
+            # this version expects?", and it missed two real cases (issue #326):
+            #
+            #   - Re-bootstrapping with a different --XRole. Each role type is its
+            #     own role (...-DdbReadOnly-... vs ...-DdbReadWrite-...), so the one
+            #     you switch to may never have been touched since a version bump
+            #     repaired the other -- yet version parity now holds, so it was
+            #     skipped forever.
+            #   - A role left half-provisioned by anything at all. CloudTrail showed
+            #     an interrupted e2e security run creating the role and stopping
+            #     after the two managed-policy attaches, so it sat with no inline
+            #     policies. Every verb then died in the cost estimate with
+            #     AccessDenied on pricing:GetProducts, and re-bootstrapping could not
+            #     fix it because the version matched.
+            #
+            # Every call below is idempotent, so doing them unconditionally is both
+            # cheap and self-repairing. The trust policy is re-applied here because
+            # create_role -- which would have set it -- was skipped.
             try:
                 self.iam_client.update_assume_role_policy(
                     RoleName=role_name,
@@ -181,25 +285,17 @@ class BootstrapInfrastructure:
                 PolicyDocument=json.dumps(quotas_policy)
             )
             log.debug(f'Attached quotas policy to role {role_name}')
+
+            # Give read-only access to autoscaling targets (issue #89 rate warnings)
+            self.iam_client.put_role_policy(
+                RoleName=role_name,
+                PolicyName='MinimalAutoScalingAccess',
+                PolicyDocument=json.dumps(autoscaling_policy)
+            )
+            log.debug(f'Attached autoscaling policy to role {role_name}')
         except Exception as e:
             log.error(f'Unexpected error: {e}')
             exit(1)
-
-    def _needs_role_refresh(self):
-        job_details = self._get_glue_job_details()
-        if not job_details:
-            return True
-        deployed_version = job_details['Job']['DefaultArguments'].get('--bulk-dynamodb-version')
-        if not deployed_version:
-            return True
-        if deployed_version != VERSION:
-            log.info(
-                f"Version mismatch (deployed Glue job is v{deployed_version}, "
-                f"local is v{VERSION}); refreshing the role's IAM policies to "
-                f"match the version being bootstrapped."
-            )
-            return True
-        return False
 
     def _is_existing_role(self, role_name):
         try:
@@ -335,6 +431,7 @@ class BootstrapInfrastructure:
                     **bucket_config
                 )
                 log.info(f"Bucket '{glue_job_bucket}' created successfully!")
+                self._bucket_created_this_run = glue_job_bucket
             except Exception as e:
                 log.error(f"Error creating bucket '{glue_job_bucket}': {e}")
                 exit(1)
@@ -508,52 +605,135 @@ class BootstrapInfrastructure:
         self.s3_client.upload_file(f"./{LOG4J_PROPERTIES_FILE}", glue_job_bucket, LOG4J_PROPERTIES_FILE)
         log.info(f"Properties files '{LOG4J_PROPERTIES_FILE}' uploaded into S3 successfully!")
 
+    def _get_log_group_retention(self, log_group_name):
+        """Return the retentionInDays set on log_group_name, or None if unset.
+
+        describe_log_groups takes a name *prefix* and can return multiple groups,
+        so match the exact name rather than trusting the first result.
+        """
+        response = self.logs_client.describe_log_groups(logGroupNamePrefix=log_group_name)
+        for group in response.get('logGroups', []):
+            if group.get('logGroupName') == log_group_name:
+                return group.get('retentionInDays')
+        return None
+
     def _create_glue_log_groups(self):
         """
         Create CloudWatch log groups for Glue job logging ahead of time.
-        This prevents the need to wait for log groups to be created during job execution.
+
+        We really prefer to create the log groups here proactively before the
+        first Glue job run so during the first execution we can attach LiveTail
+        immediately and not miss any early output. Creating them is therefore
+        necessary, and a failure here is fatal.
+
+        We politely try to set a retention policy if we have permissions, but if
+        we can't then we'll let the default stand. An existing retention policy
+        other than the default of None we leave alone. So retention failures warn
+        and carry on (issues #294, #301).
         """
         log.info("Creating CloudWatch log groups for Glue job...")
         
         for log_group_name in GLUE_LOG_GROUP_NAMES:
+            # --- necessary: the group itself must exist (see docstring) ---
+            group_existed = False
             try:
                 # Try to create the log group - AWS will tell us if it already exists
                 self.logs_client.create_log_group(logGroupName=log_group_name)
                 log.info(f"Created log group: {log_group_name}")
-
-                self.logs_client.put_retention_policy(
-                    logGroupName=log_group_name,
-                    retentionInDays=GLUE_LOG_GROUP_RETENTION_IN_DAYS
+            except self.logs_client.exceptions.ResourceAlreadyExistsException:
+                log.info(f"Log group '{log_group_name}' already exists.")
+                group_existed = True
+            except Exception as e:
+                log.error(
+                    f"Could not create log group '{log_group_name}': {e}. "
+                    f"The Glue job streams its output through this log group, "
+                    f"and bulk commands wait for it to exist before tailing -- "
+                    f"without it, early job output is lost and commands can "
+                    f"exit while waiting. Grant logs:CreateLogGroup and "
+                    f"re-run bootstrap."
                 )
-                log.info(f"Set retention policy for {log_group_name} to {GLUE_LOG_GROUP_RETENTION_IN_DAYS} days")
+                exit(1)
 
-            except ClientError as e:
-                if e.response['Error']['Code'] == 'ResourceAlreadyExistsException':
-                    log.info(f"Log group '{log_group_name}' already exists.")
+            # --- courtesy: retention is a default, never worth failing over ---
+            # Only set retention if the group has none. If an account owner
+            # deliberately chose a retention (e.g. 30 days for cost, or a longer
+            # window for compliance), we must not clobber it on every bootstrap.
+            # A group with no policy (e.g. auto-created by Glue, so "never
+            # expire") still gets our default. Staying silent when we leave an
+            # existing policy alone keeps the console clean.
+            try:
+                if not group_existed:
                     self.logs_client.put_retention_policy(
                         logGroupName=log_group_name,
                         retentionInDays=GLUE_LOG_GROUP_RETENTION_IN_DAYS
                     )
-                    log.info(f"Updated retention policy for existing log group {log_group_name}")
-                else:
-                    raise e # Handle failure case for all other errors at the higher level catch
+                    log.info(f"Set retention policy for {log_group_name} to {GLUE_LOG_GROUP_RETENTION_IN_DAYS} days")
+                elif self._get_log_group_retention(log_group_name) is None:
+                    self.logs_client.put_retention_policy(
+                        logGroupName=log_group_name,
+                        retentionInDays=GLUE_LOG_GROUP_RETENTION_IN_DAYS
+                    )
+                    log.info(f"Set retention policy for existing log group {log_group_name} to {GLUE_LOG_GROUP_RETENTION_IN_DAYS} days (had none)")
             except Exception as e:
-                log.error(f"Unexpected error creating log group '{log_group_name}': {e}")
-                exit(1)
+                # Surface the underlying error (it names the denied operation) and
+                # the consequence, so the warning is actionable rather than noise
+                # (issues #294, #301).
+                log.warning(
+                    f"Could not manage the retention policy on log group "
+                    f"'{log_group_name}' ({e}); continuing. Any retention already "
+                    f"set is left untouched, and log capture is unaffected."
+                )
 
     def bootstrap(self, args):
-        self._add_glue_job_role(args)
-        self._create_glue_log_groups()
-        self._ensure_dynamodb_glue_connection()
-        self._create_or_update_glue_job(args)
-        self._upload_job_root_to_s3()
-        self.update_python_modules_in_s3()
-        self._upload_property_files_to_s3()
+        try:
+            self._add_glue_job_role(args)
+            self._create_glue_log_groups()
+            self._ensure_dynamodb_glue_connection()
+            self._create_or_update_glue_job(args)
+            self._upload_job_root_to_s3()
+            self.update_python_modules_in_s3()
+            self._upload_property_files_to_s3()
+        except SystemExit:
+            # Any step may exit(1). Report here rather than at each call site so
+            # a new step can't forget to (issue #307).
+            self._report_resources_left_behind()
+            raise
+
+    def _report_resources_left_behind(self):
+        """Name anything this run created before bootstrap failed (issue #307).
+
+        Only resources THIS run created are reported -- a role that already
+        existed was not ours to leak. teardown resolves resources through the
+        Glue job, so when bootstrap dies before creating the job it bails with
+        "Unable to determine glue job bucket name" and never reaches them; the
+        operator needs to know they exist and that teardown won't help.
+        """
+        leftovers = []
+        if self._role_created_this_run:
+            leftovers.append(f"IAM role '{self._role_created_this_run}'")
+        if self._bucket_created_this_run:
+            leftovers.append(f"S3 bucket '{self._bucket_created_this_run}'")
+        if not leftovers:
+            return
+
+        # Agree in number: the common case is a single leftover (the role), and
+        # "IAM role 'x', which have been left in place" reads like a bug in a
+        # message whose whole job is to be trusted.
+        has_have = "has" if len(leftovers) == 1 else "have"
+        it_them = "it" if len(leftovers) == 1 else "them"
+        log.error(
+            f"Bootstrap did not complete. It had already created "
+            f"{' and '.join(leftovers)}, which {has_have} been left in place. "
+            f"Fix the error above and re-run bootstrap to reuse {it_them}. To "
+            f"remove {it_them} instead, delete {it_them} manually -- 'bulk "
+            f"teardown' finds resources through the Glue job, so it cannot clean "
+            f"up when the job was never created."
+        )
 
     def _ensure_dynamodb_glue_connection(self):
         """Create a Glue connection of type DYNAMODB if missing.
 
-        Glue 5.x requires this connection to be attached to the job for
+        Glue 5.0+ requires this connection to be attached to the job for
         the DataFrame-based DynamoDB source (spark.read.format("dynamodb"))
         to register on the Spark classpath. Without it, jobs invoking the
         new connector fail with "[DATA_SOURCE_NOT_FOUND] dynamodb".

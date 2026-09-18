@@ -1,8 +1,8 @@
 import argparse
 import json
-import os
 import re
 import sys
+from collections import namedtuple
 from typing import Optional
 
 import boto3
@@ -15,19 +15,147 @@ from utils.logger import ColorCodes, log
 SUPPORTED_EXECUTION_CLASSES = ['STANDARD', 'FLEX']
 SUPPORTED_WORKER_TYPES = ['G.1X', 'G.2X', 'G.4X', 'G.8X', 'G.12X', 'G.16X', 'R.1X', 'R.2X', 'R.4X', 'R.8X']
 
+# Suppressed *and counted*, with a one-line summary before the closing line.
+#
+# The bar for this list is narrow: only noise where suppression might have gone too far --
+# where the message we hide could, in some run we have not seen, have been the thing worth
+# reading. The count is that admission. Anything we are confident nobody ever needs belongs
+# in LOG_PATTERN_IGNORE_LIST instead, because a heads-up about output that never matters is
+# just the noise again in a smaller font.
+#
+# The label is what the summary calls them, so write it for someone deciding whether to go
+# and look. Nothing whose absence could disguise lost work belongs here either: task-level
+# failures (`Lost task`, `ExecutorLostFailure`), stage failures and job aborts are never
+# filtered, counted or otherwise -- they are how a genuinely dying cluster announces itself.
+COUNTED_NOISE_PATTERNS = [
+    # Spark reports a query-analysis failure itself, before our handler turns it into
+    # "SQL query error: ...", as one ~10 KB JSON event. Its `msg` field duplicates what we
+    # print, so the primary message is not lost -- but the same blob carries the unresolved
+    # query plan, and for a join with an ambiguous column that plan is the debugging aid
+    # rather than the sentence. Counted because of the plan. Issue #332.
+    (r'"logger": "SQLQueryContextLogger"', "Spark query-analysis dumps"),
+    # An executor going away logs at ERROR whether it was decommissioned or OOM-killed --
+    # the text is identical, so this line cannot tell them apart. Measured on the max_rate
+    # run: 21 in the same second after the write ramped down, zero lost tasks, all 18M items
+    # verified. The consequences of a real death are separate messages and are not filtered,
+    # so suppression costs a symptom, not a diagnosis. Counted because a pattern of these
+    # without task loss would otherwise be invisible, and that is the early signal for a
+    # memory-default regression. Issue #302.
+    (r"Remote RPC client disassociated", "executors released mid-run"),
+]
+
+# Suppressed silently. Routine chatter that is not error-shaped or fires on every single
+# run, so counting it would put the noise back in a different form.
 LOG_PATTERN_IGNORE_LIST = [
     r"Running autoDebugger shutdown hook.",
     r"Error while invoking RpcHandler#receive() for one-way message.",
+    # Benign Netty noise: the driver fails to stream a JAR/result to an executor
+    # whose channel already closed. Prints red (contains ERROR) but does not affect
+    # processing -- seen on tiny jobs (e.g. a diff of two small tables). Issue #247.
+    # Not counted: nothing a user could act on, and a network fault bad enough to
+    # matter shows up as task failures, which are never filtered.
+    r"Error sending result StreamResponse",
+    # The JVM's own out-of-memory banner, whose other lines are a hook command and the
+    # /bin/sh that runs it, both naming a /tmp/glue-job-<digits>/ path on a machine the user
+    # cannot reach. All four arrive as one event, so this anchor takes the heap error with
+    # them -- deliberate: bulk matches the same event and prints "Stopping the job: the job
+    # ran out of memory." plus what to change. Suppressing it cannot hide the signal, because
+    # UNHEALTHY_STATE_LOG_SIGNALS is matched against raw events before this filter runs.
+    r"-XX:OnOutOfMemoryError=",
+    # Glue 6.0 ships an invalid escape sequence in its own job wrapper
+    # (pythonrunner/runscript.py), which Python 3.13 surfaces as a visible
+    # SyntaxWarning on every single run -- 26/26 job runs in testing. It arrives
+    # as one output-group event carrying both the warning and its echoed source
+    # line, so this single pattern drops the whole thing. Not actionable by
+    # users: it fires while Python compiles Glue's wrapper, before our code is
+    # imported, so no filter in server/src can reach it. Remove once AWS fixes
+    # the image. Issue #292.
+    r"SyntaxWarning: invalid escape sequence",
+    # Glue's own metrics reporter races on the map behind its stage-skewness gauge and
+    # logs the ConcurrentModificationException at ERROR -- then says in the same line
+    # that it suppressed it. It arrives on a *successful* run, right before the result
+    # line, as one output-group event carrying the header and all 18 frames, so this
+    # single anchor drops the whole thing. Nothing in it is ours: every frame is
+    # aws-glue-di-package.jar or metrics-core. Remove once AWS fixes the image.
+    # Issue #334. Not counted: the failure is in Glue's telemetry, never in the job,
+    # so there is no run in which its reporting trouble is worth a heads-up.
+    r"Exception thrown from AWSDILyraMetricsReporter#report",
 ]
 
-# Intentional nuanced configs:
-# - PascaleCase Keys
-# - Suffix symbols
-UNHEALTHY_STATE_LOG_MESSAGE_KEYS = [
-    "AccessDeniedException:",
-    "ModuleNotFoundError:",
-    "OutOfMemoryError:",
-    "ProvisionedThroughputExceededException:"
+# One fatal log pattern, and what to tell the user when it turns up. See
+# UNHEALTHY_STATE_LOG_SIGNALS below for how the three parts are used.
+UnhealthySignal = namedtuple('UnhealthySignal', 'pattern summary advice')
+
+# Recognises a memory failure in the run's *final* ErrorMessage, for the path where the
+# watchdog never fired -- a driver that dies before it can log, or a signal that arrived
+# after live tail closed. "OUT_OF_MEMORY_ERROR" is Glue's own error category; the other two
+# are the JVM's wording and Glue's sentence ("Glue job failed due to driver out of memory").
+MEMORY_FAILURE_MARKERS = (
+    "OUT_OF_MEMORY_ERROR",
+    "OutOfMemoryError",
+    "out of memory",
+)
+
+# Named separately because three paths share it: a heap that fills up on the driver, one
+# that fills up on an executor, and a memory failure recognised only in Glue's closing
+# ErrorMessage. All three call for the same first move.
+#
+# R.1X leads because it is the lever that fits, measured rather than assumed. Read from the
+# driver's own bootstrap command line: G.1X runs with spark.executor.memory=10g and
+# spark.driver.memory=10g, R.1X with 20g and 20g. Verified end to end -- a collect_list query
+# that exhausted a G.1X executor succeeded unchanged on R.1X. (vCPU counts are not observable in
+# Glue logs, so nothing here claims parity on those.)
+MEMORY_ADVICE = (
+    "Use --XWorkerType to run on a worker with more memory; R.1X has double the heap of the "
+    "default G.1X."
+)
+
+# A log line matching one of these means the run cannot finish, so bulk stops the job
+# rather than let it burn DPU-minutes on a doomed retry loop.
+#
+# Each signal carries what to tell the user, because when we stop a job there are three
+# separate reasons nothing else will:
+#
+# 1. The line that named the cause is usually on an *executor* stream, and
+#    _pretty_print_log_event drops those unread -- they are framework noise, and mixing them
+#    into the driver's output mislabelled it (#284). So the watchdog sees the cause and the
+#    user does not.
+# 2. Glue records a stop as STOPPED with no ErrorMessage. A failed run carries a reason; a
+#    stopped one carries nothing, and we turned the failure into a stop.
+# 3. The closing line is derived from the Glue state alone, so our stop and a user's Ctrl+C
+#    both reached "Job was stopped." in the same warning yellow.
+#
+# Measured before this existed: an executor exhausting its 10 GB heap produced exactly three
+# lines -- "indicate the Glue Job is unhealthy! Shutting down", the stop itself, and "Job was
+# stopped." -- with the words "out of memory" nowhere in them, and a Glue console entry
+# showing a stopped job with no reason at all.
+#
+# Adding one:
+#
+# `pattern` is matched as a substring against raw log events from every stream, driver and
+# executor alike. Write it exactly as the JVM or the AWS SDK prints it, case and trailing
+# punctuation included -- matching the printed form is what keeps it from matching loosely.
+#
+# `summary` is a clause, because it has to complete two sentences: "Stopping the job:
+# <summary>." when the line is seen, and "Job failed: <summary>." as the run's last line.
+#
+# `advice` is the next thing to try, printed once, right after the summary.
+UNHEALTHY_STATE_LOG_SIGNALS = [
+    UnhealthySignal(
+        "OutOfMemoryError:", "the job ran out of memory", MEMORY_ADVICE),
+    UnhealthySignal(
+        "AccessDeniedException:", "the job was denied an AWS permission",
+        "The denied action is named in the output above. Re-run './bulk bootstrap' with a "
+        "role that allows it -- --XRole READ-WRITE for anything that writes."),
+    UnhealthySignal(
+        "ModuleNotFoundError:", "the job could not import a Python module",
+        "A generator or --transform module has to be deployed with './bulk bootstrap' "
+        "before a job can import it."),
+    UnhealthySignal(
+        "ProvisionedThroughputExceededException:",
+        "DynamoDB throttled the job past the SDK's own retries",
+        "Give the table more capacity, or hold bulk back with --XMaxReadRate / "
+        "--XMaxWriteRate so it stays under what the table can serve."),
 ]
 
 STD_ERROR_MESSAGE_KEYS = [ # Lowercase Keys Intentional
@@ -44,13 +172,10 @@ CONFIG_LOG_MESSAGE_KEYS = [
     "arguments:",
 ]
 
-WARN_LOG_MESSAGE_KEYS = [
-    " WARN ", # Surrounding spaces intentional.
-]
-
 _ENV_OR_SCRIPT_KEYS = set([
     'XMaxWriteRate',
     'XMaxReadRate',
+    'XTimeout',  # Forwarded so the server can race the job-timeout estimate (#89)
 ])
 
 # We can perhaps move this somewhere else later
@@ -139,7 +264,13 @@ def validate_tables(env_configs, parser, *tables, index=None, pitr_enabled=False
     reference_table = None
 
     for table_name in tables:
-        region = _region_from_table_ref(table_name) or _default_region() # each table might be in a diff region
+        # The run's own region, not the shell's default: --XRegion decides where the Glue
+        # job runs, so it has to decide which table we validate too. A full ARN still
+        # wins, since a cross-region source and target legitimately differ (#333).
+        # No fallback on purpose: EnvConfigs exits when it cannot resolve a region, so a
+        # missing one here means the caller passed something that is not an EnvConfigs --
+        # and guessing at that point is how #333 happened in the first place.
+        region = _region_from_table_ref(table_name) or env_configs.aws_region
         clients = Clients(region)
         dynamodb_client = clients.dynamodb_client
 
@@ -270,13 +401,6 @@ def validate_s3_export_path(s3_path):
 
 
 # The below is also in the server codebase
-
-def _default_region():
-    return (
-        boto3.Session().region_name
-        or os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-    )
 
 def _parse_arn(arn: str) -> dict:
     """

@@ -36,6 +36,20 @@ def bootstrap():
         clients.s3_client = MagicMock()
         clients.glue_client = MagicMock()
         clients.logs_client = MagicMock()
+
+        # botocore generates a typed exception class per client, and production
+        # code catches logs_client.exceptions.ResourceAlreadyExistsException. A
+        # MagicMock attribute can't appear in an `except` clause ("catching
+        # classes that do not inherit from BaseException"), so give that one a
+        # real class. Tests raise it via
+        # bootstrap.logs_client.exceptions.ResourceAlreadyExistsException.
+        class ResourceAlreadyExistsException(Exception):
+            pass
+
+        clients.logs_client.exceptions.ResourceAlreadyExistsException = (
+            ResourceAlreadyExistsException
+        )
+
         MockClients.return_value = clients
 
         from infrastructure.bootstrap import BootstrapInfrastructure
@@ -138,9 +152,19 @@ class TestGetRoleName:
         assert name == f"{GLUE_JOB_ROOT_ROLE_NAME}-{READ_WRITE_ROLE_ID}-us-east-1"
 
     def test_existing_custom_role_is_returned(self, bootstrap):
+        # This test covers param routing (a custom role name is returned), not
+        # validation, so stub the validator to no findings. The validator's own
+        # warn/eject behavior is covered in test_role_validator's
+        # TestIntegrationWithBootstrap.
         bootstrap._is_existing_role = MagicMock(return_value=True)
-        assert bootstrap._get_role_name({'XRole': 'MyCustomRole'}) == 'MyCustomRole'
-        bootstrap._is_existing_role.assert_called_once_with('MyCustomRole')
+        with patch(
+            'infrastructure.bootstrap.validate_custom_role_permissions',
+            return_value=[],
+        ):
+            assert bootstrap._get_role_name(
+                {'XRole': 'AWSGlueServiceRole-MyCustom'}
+            ) == 'AWSGlueServiceRole-MyCustom'
+        bootstrap._is_existing_role.assert_called_once_with('AWSGlueServiceRole-MyCustom')
 
     def test_missing_custom_role_exits(self, bootstrap, capsys):
         bootstrap._is_existing_role = MagicMock(return_value=False)
@@ -149,6 +173,69 @@ class TestGetRoleName:
         assert exc.value.code == 1
         out = capsys.readouterr().out
         assert 'NoSuchRole' in out
+
+
+class TestCustomRoleValidatedOncePerRun:
+    """bootstrap() resolves the role name twice (_add_glue_job_role and
+    _create_or_update_glue_job). Custom-role validation is heavyweight (IAM
+    reads + SimulatePrincipalPolicy), so a custom --XRole must be validated at
+    most once per run and its WARNINGs logged only once — but a FATAL must
+    still eject on the first resolution and never be cached."""
+
+    def test_clean_custom_role_validated_only_once_across_two_resolutions(
+        self, bootstrap
+    ):
+        bootstrap._is_existing_role = MagicMock(return_value=True)
+        with patch(
+            'infrastructure.bootstrap.validate_custom_role_permissions',
+            return_value=[],
+        ) as validate:
+            first = bootstrap._get_role_name({'XRole': 'AWSGlueServiceRole-Mine'})
+            second = bootstrap._get_role_name({'XRole': 'AWSGlueServiceRole-Mine'})
+
+        assert first == second == 'AWSGlueServiceRole-Mine'
+        validate.assert_called_once()
+
+    def test_warnings_logged_only_once_across_two_resolutions(
+        self, bootstrap, caplog
+    ):
+        import logging
+
+        from utils.role_validator import Finding, WARNING
+
+        bootstrap._is_existing_role = MagicMock(return_value=True)
+        finding = Finding(WARNING, 'role lacks pricing:GetProducts')
+        with patch(
+            'infrastructure.bootstrap.validate_custom_role_permissions',
+            return_value=[finding],
+        ) as validate, caplog.at_level(logging.WARNING):
+            bootstrap._get_role_name({'XRole': 'AWSGlueServiceRole-Mine'})
+            bootstrap._get_role_name({'XRole': 'AWSGlueServiceRole-Mine'})
+
+        # Validation runs once and the warning is emitted once, not doubled.
+        validate.assert_called_once()
+        warnings = [
+            r.message for r in caplog.records
+            if r.levelno == logging.WARNING and 'pricing:GetProducts' in r.message
+        ]
+        assert len(warnings) == 1, f"expected one warning, got {warnings}"
+
+    def test_fatal_role_never_cached_and_ejects(self, bootstrap):
+        from utils.role_validator import FATAL, Finding
+
+        bootstrap._is_existing_role = MagicMock(return_value=True)
+        finding = Finding(FATAL, "trust policy doesn't allow glue.amazonaws.com")
+        with patch(
+            'infrastructure.bootstrap.validate_custom_role_permissions',
+            return_value=[finding],
+        ):
+            with pytest.raises(SystemExit) as exc:
+                bootstrap._get_role_name({'XRole': 'AWSGlueServiceRole-Broken'})
+
+        assert exc.value.code == 1
+        # A FATAL role must not be recorded as validated — re-resolving it would
+        # (correctly) eject again rather than silently returning a bad role.
+        assert 'AWSGlueServiceRole-Broken' not in bootstrap._validated_custom_roles
 
 
 # -- _is_existing_role --------------------------------------------------
@@ -224,13 +311,40 @@ class TestAddGlueJobRole:
         assert 'arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess' in attached
         assert 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess' not in attached
 
-        # Inline policies for pricing + quotas
+        # Inline policies for pricing + quotas + autoscaling
         inline_names = [
             c.kwargs['PolicyName']
             for c in bootstrap.iam_client.put_role_policy.call_args_list
         ]
         assert 'MinimalPricingAccess' in inline_names
         assert 'MinimalQuotasAccess' in inline_names
+        assert 'MinimalAutoScalingAccess' in inline_names
+
+    def test_autoscaling_policy_grants_both_describe_reads(self, bootstrap):
+        from infrastructure.constants import ROLE_TYPE_READ_ONLY
+        bootstrap._prompt_for_role = MagicMock()
+        bootstrap.iam_client.create_role.return_value = {
+            'Role': {'Arn': 'arn:aws:iam::123456789012:role/test'}
+        }
+
+        bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
+
+        autoscaling_calls = [
+            c for c in bootstrap.iam_client.put_role_policy.call_args_list
+            if c.kwargs['PolicyName'] == 'MinimalAutoScalingAccess'
+        ]
+        assert len(autoscaling_calls) == 1
+        doc = json.loads(autoscaling_calls[0].kwargs['PolicyDocument'])
+        stmt = doc['Statement'][0]
+        # Issue #297: the diagnostic needs BOTH reads -- ScalableTargets for
+        # min/max, ScalingPolicies for the target value. Granting only the first
+        # left the diagnostic permanently half-broken.
+        assert stmt['Action'] == [
+            'application-autoscaling:DescribeScalableTargets',
+            'application-autoscaling:DescribeScalingPolicies',
+        ]
+        # Neither action supports resource-level scoping.
+        assert stmt['Resource'] == '*'
 
     def test_creates_role_and_attaches_read_write_policies(self, bootstrap):
         from infrastructure.constants import ROLE_TYPE_READ_WRITE
@@ -248,10 +362,8 @@ class TestAddGlueJobRole:
         assert 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess' in attached
         assert 'arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess' not in attached
 
-    def test_role_already_exists_returns_without_attaching_policies(self, bootstrap):
-        from infrastructure.constants import ROLE_TYPE_READ_ONLY
-        bootstrap._prompt_for_role = MagicMock()
-
+    def _existing_role(self, bootstrap):
+        """Make create_role report the role already exists."""
         class EntityAlreadyExistsException(Exception):
             pass
         bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
@@ -259,7 +371,22 @@ class TestAddGlueJobRole:
         )
         bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
 
-        # Version matches — no refresh needed
+    def test_existing_role_is_brought_up_to_the_current_policy_set(self, bootstrap):
+        """An existing role is (re)provisioned on every bootstrap (#326).
+
+        This used to return early unless __version__ had changed, which meant a
+        role could stay wrong forever. Two real cases it missed: re-bootstrapping
+        with a different --XRole (each type is its own role, so the one you switch
+        to may never have been touched since the bump that repaired the other), and
+        a role left half-provisioned by an interrupted run -- CloudTrail showed one
+        created with its two managed policies and no inline ones, after which every
+        verb died in the cost estimate on pricing:GetProducts and re-bootstrapping
+        could not repair it because the version matched.
+        """
+        from infrastructure.constants import ROLE_TYPE_READ_ONLY
+        bootstrap._prompt_for_role = MagicMock()
+        self._existing_role(bootstrap)
+        # A matching version must no longer be an excuse to skip the work.
         from __version__ import __version__ as VERSION
         bootstrap._get_glue_job_details = MagicMock(return_value={
             'Job': {'DefaultArguments': {'--bulk-dynamodb-version': VERSION}}
@@ -267,194 +394,55 @@ class TestAddGlueJobRole:
 
         bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
 
-        # Early return — no policy attachments
-        bootstrap.iam_client.attach_role_policy.assert_not_called()
-        bootstrap.iam_client.put_role_policy.assert_not_called()
+        attached = [c.kwargs['PolicyArn']
+                    for c in bootstrap.iam_client.attach_role_policy.call_args_list]
+        assert any('AWSGlueServiceRole' in a for a in attached), attached
+        assert any('AmazonDynamoDBReadOnlyAccess' in a for a in attached), attached
+        inline = [c.kwargs['PolicyName']
+                  for c in bootstrap.iam_client.put_role_policy.call_args_list]
+        assert set(inline) == {'MinimalPricingAccess', 'MinimalQuotasAccess',
+                               'MinimalAutoScalingAccess'}, inline
 
-    def test_role_already_exists_refreshes_policies_on_version_mismatch(self, bootstrap):
+    def test_existing_role_gets_the_trust_policy_reapplied(self, bootstrap):
+        """create_role would have set it, and it was skipped."""
         from infrastructure.constants import ROLE_TYPE_READ_ONLY
         bootstrap._prompt_for_role = MagicMock()
-
-        class EntityAlreadyExistsException(Exception):
-            pass
-        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
-            EntityAlreadyExistsException
-        )
-        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
-
-        # Simulate a version mismatch: Glue job has an older version
-        bootstrap._get_glue_job_details = MagicMock(return_value={
-            'Job': {'DefaultArguments': {'--bulk-dynamodb-version': '0'}}
-        })
+        self._existing_role(bootstrap)
 
         bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
 
-        # Despite the role already existing, policies MUST be refreshed
-        # because the version changed.
-        bootstrap.iam_client.attach_role_policy.assert_called()
-        bootstrap.iam_client.put_role_policy.assert_called()
-
-    def test_version_mismatch_logs_info_with_both_versions(self, bootstrap, caplog):
-        import logging
-        from infrastructure.constants import ROLE_TYPE_READ_ONLY
-        from __version__ import __version__ as VERSION
-        bootstrap._prompt_for_role = MagicMock()
-
-        class EntityAlreadyExistsException(Exception):
-            pass
-        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
-            EntityAlreadyExistsException
-        )
-        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
-
-        bootstrap._get_glue_job_details = MagicMock(return_value={
-            'Job': {'DefaultArguments': {'--bulk-dynamodb-version': '0.old'}}
-        })
-
-        with caplog.at_level(logging.INFO):
-            bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
-
-        # Reviewer feedback (#233): a version mismatch during bootstrap is the
-        # expected reason someone is bootstrapping, so it is INFO, not WARNING.
-        info_messages = [r.message for r in caplog.records if r.levelno == logging.INFO]
-        mismatch_msgs = [m for m in info_messages if '0.old' in m and VERSION in m]
-        assert mismatch_msgs, (
-            f"Expected an info message mentioning deployed version '0.old' and "
-            f"local version '{VERSION}', got: {info_messages}"
-        )
-        # It must NOT be logged at WARNING (or higher) -- nothing is wrong.
-        loud = [
-            r.message for r in caplog.records
-            if r.levelno >= logging.WARNING and '0.old' in r.message
-        ]
-        assert not loud, f"Version mismatch must not log at WARNING or above, got: {loud}"
-
-        msg = mismatch_msgs[0]
-        # Must explain what happens (policies refreshed) without telling the user
-        # to redeploy -- they are already mid-bootstrap.
-        assert 'refresh' in msg.lower(), (
-            f"Message must explain the role's IAM policies are being refreshed, got: {msg}"
-        )
-        assert 'redeploy' not in msg.lower(), (
-            f"Message must not tell the user to redeploy mid-bootstrap, got: {msg}"
-        )
-
-    def test_version_mismatch_message_is_direction_agnostic(self, bootstrap, caplog):
-        # Reviewer feedback (#233): the logic must work when the client is OLDER
-        # as well as NEWER than the deployed job. The message must not assume the
-        # local version is the newer one (no "upgrade"/"you are ahead" phrasing).
-        import logging
-        from infrastructure.constants import ROLE_TYPE_READ_ONLY
-        from __version__ import __version__ as VERSION
-        bootstrap._prompt_for_role = MagicMock()
-
-        class EntityAlreadyExistsException(Exception):
-            pass
-        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
-            EntityAlreadyExistsException
-        )
-        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
-
-        # Deployed job is on a higher version than the local client, i.e. the
-        # local client is behind what is deployed. Use a neutral label so the
-        # assertions below check the message wording, not the version value.
-        deployed_version = '99999'
-        bootstrap._get_glue_job_details = MagicMock(return_value={
-            'Job': {'DefaultArguments': {'--bulk-dynamodb-version': deployed_version}}
-        })
-
-        with caplog.at_level(logging.INFO):
-            bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
-
-        # Refresh still happens regardless of direction.
-        bootstrap.iam_client.attach_role_policy.assert_called()
-        bootstrap.iam_client.put_role_policy.assert_called()
-
-        msg = next(
-            m for m in (r.message for r in caplog.records)
-            if deployed_version in m and VERSION in m
-        )
-        lowered = msg.lower()
-        for directional in ('upgrade', 'downgrade', 'newer', 'older', 'ahead', 'behind'):
-            assert directional not in lowered, (
-                f"Message must be direction-agnostic (works for older or newer "
-                f"clients); found '{directional}' in: {msg}"
-            )
-
-    def test_role_already_exists_skips_refresh_when_version_matches(self, bootstrap):
-        from infrastructure.constants import ROLE_TYPE_READ_ONLY
-        bootstrap._prompt_for_role = MagicMock()
-
-        class EntityAlreadyExistsException(Exception):
-            pass
-        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
-            EntityAlreadyExistsException
-        )
-        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
-
-        # Simulate version match: Glue job has same version as local
-        from __version__ import __version__ as VERSION
-        bootstrap._get_glue_job_details = MagicMock(return_value={
-            'Job': {'DefaultArguments': {'--bulk-dynamodb-version': VERSION}}
-        })
-
-        bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
-
-        # Version matches — no need to refresh policies
-        bootstrap.iam_client.attach_role_policy.assert_not_called()
-        bootstrap.iam_client.put_role_policy.assert_not_called()
-
-    def test_refresh_updates_trust_policy_to_match_fresh_bootstrap(self, bootstrap):
-        # Reviewer feedback: on a version-mismatch refresh of an existing role,
-        # the code re-applies attached/inline policies but the trust policy
-        # (AssumeRolePolicyDocument) is only set at create_role time. If the
-        # trust_policy definition changes and the version is bumped, a refreshed
-        # role would keep its stale trust policy — NOT matching a fresh
-        # bootstrap. The refresh must also update the assume-role (trust) policy.
-        from infrastructure.constants import ROLE_TYPE_READ_ONLY
-        bootstrap._prompt_for_role = MagicMock()
-
-        class EntityAlreadyExistsException(Exception):
-            pass
-        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
-            EntityAlreadyExistsException
-        )
-        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
-
-        # Version mismatch → refresh path.
-        bootstrap._get_glue_job_details = MagicMock(return_value={
-            'Job': {'DefaultArguments': {'--bulk-dynamodb-version': '0.old'}}
-        })
-
-        bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
-
-        # The trust policy must be re-applied so the refreshed role ends up with
-        # the same trust policy a fresh bootstrap would create.
         bootstrap.iam_client.update_assume_role_policy.assert_called_once()
-        kwargs = bootstrap.iam_client.update_assume_role_policy.call_args.kwargs
-        trust = json.loads(kwargs['PolicyDocument'])
-        assert trust['Statement'][0]['Principal']['Service'] == 'glue.amazonaws.com'
+        doc = bootstrap.iam_client.update_assume_role_policy.call_args.kwargs['PolicyDocument']
+        assert 'glue.amazonaws.com' in doc
 
-    def test_role_already_exists_refreshes_when_no_deployed_version(self, bootstrap):
+    def test_existing_read_write_role_gets_write_access(self, bootstrap):
+        """The policy set must follow --XRole, not whatever the role had before."""
+        from infrastructure.constants import ROLE_TYPE_READ_WRITE
+        bootstrap._prompt_for_role = MagicMock()
+        self._existing_role(bootstrap)
+
+        bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_WRITE})
+
+        attached = [c.kwargs['PolicyArn']
+                    for c in bootstrap.iam_client.attach_role_policy.call_args_list]
+        assert any('AmazonDynamoDBFullAccess' in a for a in attached), attached
+        assert not any('AmazonDynamoDBReadOnlyAccess' in a for a in attached), attached
+
+    def test_provisioning_does_not_consult_the_deployed_version(self, bootstrap):
+        """No version comparison is involved any more.
+
+        Guards the actual regression risk: reintroducing any "we look current, skip
+        it" shortcut. _get_glue_job_details raises here, so touching it fails.
+        """
         from infrastructure.constants import ROLE_TYPE_READ_ONLY
         bootstrap._prompt_for_role = MagicMock()
-
-        class EntityAlreadyExistsException(Exception):
-            pass
-        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
-            EntityAlreadyExistsException
-        )
-        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
-
-        # No Glue job exists yet (first bootstrap with pre-existing role)
-        bootstrap._get_glue_job_details = MagicMock(return_value=None)
+        self._existing_role(bootstrap)
+        bootstrap._get_glue_job_details = MagicMock(
+            side_effect=AssertionError('role provisioning must not depend on the job version'))
 
         bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
 
-        # No deployed version to compare → must refresh to be safe
-        bootstrap.iam_client.attach_role_policy.assert_called()
         bootstrap.iam_client.put_role_policy.assert_called()
-
     def test_unexpected_create_role_error_exits(self, bootstrap):
         from infrastructure.constants import ROLE_TYPE_READ_ONLY
         bootstrap._prompt_for_role = MagicMock()
@@ -727,31 +715,171 @@ class TestCreateGlueLogGroups:
         for c in retention_calls:
             assert c.kwargs['retentionInDays'] == GLUE_LOG_GROUP_RETENTION_IN_DAYS
 
-    def test_existing_log_group_still_updates_retention(self, bootstrap):
-        from infrastructure.constants import GLUE_LOG_GROUP_NAMES
-        bootstrap.logs_client.create_log_group.side_effect = ClientError(
-            {'Error': {'Code': 'ResourceAlreadyExistsException', 'Message': 'exists'}},
-            'CreateLogGroup',
+    def test_existing_log_group_without_retention_gets_default(self, bootstrap):
+        from infrastructure.constants import (
+            GLUE_LOG_GROUP_NAMES,
+            GLUE_LOG_GROUP_RETENTION_IN_DAYS,
         )
+        bootstrap.logs_client.create_log_group.side_effect = (
+            bootstrap.logs_client.exceptions.ResourceAlreadyExistsException('exists')
+        )
+        # Existing groups report no retention set.
+        bootstrap.logs_client.describe_log_groups.side_effect = lambda logGroupNamePrefix: {
+            'logGroups': [{'logGroupName': logGroupNamePrefix}]  # no retentionInDays key
+        }
 
         bootstrap._create_glue_log_groups()
-        # Retention still applied for each group
+
+        # A group with no retention still gets our default, for each group.
+        assert bootstrap.logs_client.put_retention_policy.call_count == len(
+            GLUE_LOG_GROUP_NAMES
+        )
+        for c in bootstrap.logs_client.put_retention_policy.call_args_list:
+            assert c.kwargs['retentionInDays'] == GLUE_LOG_GROUP_RETENTION_IN_DAYS
+
+    def test_existing_log_group_with_retention_is_left_untouched(self, bootstrap):
+        bootstrap.logs_client.create_log_group.side_effect = (
+            bootstrap.logs_client.exceptions.ResourceAlreadyExistsException('exists')
+        )
+        # Owner deliberately set 30 days; bootstrap must not clobber it.
+        bootstrap.logs_client.describe_log_groups.side_effect = lambda logGroupNamePrefix: {
+            'logGroups': [{'logGroupName': logGroupNamePrefix, 'retentionInDays': 30}]
+        }
+
+        bootstrap._create_glue_log_groups()
+
+        # No retention writes at all — the existing policy is preserved.
+        bootstrap.logs_client.put_retention_policy.assert_not_called()
+
+    def test_existing_group_retention_matches_exact_name_not_prefix(self, bootstrap):
+        from infrastructure.constants import GLUE_LOG_GROUP_NAMES
+        bootstrap.logs_client.create_log_group.side_effect = (
+            bootstrap.logs_client.exceptions.ResourceAlreadyExistsException('exists')
+        )
+        # describe_log_groups returns a prefix sibling first that DOES have a
+        # retention; only the exact-name match (no retention) should count, so we
+        # still set the default.
+        def _describe(logGroupNamePrefix):
+            return {'logGroups': [
+                {'logGroupName': logGroupNamePrefix + '-other', 'retentionInDays': 7},
+                {'logGroupName': logGroupNamePrefix},  # exact match, no retention
+            ]}
+        bootstrap.logs_client.describe_log_groups.side_effect = _describe
+
+        bootstrap._create_glue_log_groups()
+
         assert bootstrap.logs_client.put_retention_policy.call_count == len(
             GLUE_LOG_GROUP_NAMES
         )
 
-    def test_unexpected_client_error_propagates(self, bootstrap):
+    def test_create_denied_is_fatal(self, bootstrap, caplog):
+        """Creating the group IS necessary, so a denial must stay fatal.
+
+        "Glue creates them on first run" is too late: the client blocks on
+        _wait_for_log_groups_to_exist before attaching LiveTail, LiveTail never
+        replays, and the command exits if the groups don't appear within the
+        retry budget. Silently proceeding would trade a clear bootstrap failure
+        for lost job output and a command that dies later, further from the
+        cause.
+        """
+        import logging
         bootstrap.logs_client.create_log_group.side_effect = ClientError(
             {'Error': {'Code': 'AccessDenied', 'Message': 'nope'}}, 'CreateLogGroup'
         )
-        with pytest.raises(ClientError):
-            bootstrap._create_glue_log_groups()
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit) as exc:
+                bootstrap._create_glue_log_groups()
+        assert exc.value.code == 1
+        errors = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors, "a fatal failure must say why"
+        assert 'logs:CreateLogGroup' in errors[0], "name the permission to grant"
+        assert 'early job output is lost' in errors[0], (
+            "explain the consequence, so the operator knows this isn't cosmetic"
+        )
 
-    def test_unexpected_non_client_error_exits(self, bootstrap):
+    def test_unexpected_non_client_error_creating_group_is_fatal(self, bootstrap):
+        """A non-ClientError on creation is the same necessary failure."""
         bootstrap.logs_client.create_log_group.side_effect = RuntimeError('boom')
         with pytest.raises(SystemExit) as exc:
             bootstrap._create_glue_log_groups()
         assert exc.value.code == 1
+
+    def test_retention_read_denied_warns_and_continues(self, bootstrap, caplog):
+        """Issue #294's exact path, which #301 fixes.
+
+        The group exists, so the only thing left is the retention read -- whose
+        entire purpose is to AVOID clobbering a retention the account owner
+        chose. Failing closed there killed the whole bootstrap. It must warn and
+        continue: log capture is unaffected either way.
+        """
+        import logging
+        bootstrap.logs_client.create_log_group.side_effect = (
+            bootstrap.logs_client.exceptions.ResourceAlreadyExistsException('exists')
+        )
+        bootstrap.logs_client.describe_log_groups.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDeniedException', 'Message': 'no describe'}},
+            'DescribeLogGroups',
+        )
+        with caplog.at_level(logging.WARNING):
+            bootstrap._create_glue_log_groups()  # must not raise or exit
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "a denied retention read must warn, not kill bootstrap"
+        # The underlying error names the denied operation -- we surface it rather
+        # than reciting a permission list that could name the wrong one (#297).
+        assert 'DescribeLogGroups' in warnings[0]
+        assert 'left untouched' in warnings[0], (
+            "must state the existing retention is preserved -- not clobbering it "
+            "was the whole reason for the read"
+        )
+        assert 'log capture is unaffected' in warnings[0], (
+            "must distinguish this from a failure that would lose output"
+        )
+        # And it must NOT have tried to write a retention it couldn't read.
+        bootstrap.logs_client.put_retention_policy.assert_not_called()
+
+    def test_retention_write_denied_warns_and_continues(self, bootstrap, caplog):
+        """Writing retention is cosmetic, so a denial there also degrades."""
+        import logging
+        bootstrap.logs_client.put_retention_policy.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDeniedException', 'Message': 'no put'}},
+            'PutRetentionPolicy',
+        )
+        with caplog.at_level(logging.WARNING):
+            bootstrap._create_glue_log_groups()  # must not raise or exit
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "a denied retention write must warn, not kill bootstrap"
+        assert 'PutRetentionPolicy' in warnings[0], (
+            "the underlying error, which names the denied operation, must surface"
+        )
+        # The groups themselves were still created -- that part must not be skipped.
+        assert bootstrap.logs_client.create_log_group.called
+
+
+class TestGetLogGroupRetention:
+    def test_returns_retention_when_set(self, bootstrap):
+        bootstrap.logs_client.describe_log_groups.return_value = {
+            'logGroups': [{'logGroupName': '/aws-glue/jobs/output', 'retentionInDays': 90}]
+        }
+        assert bootstrap._get_log_group_retention('/aws-glue/jobs/output') == 90
+
+    def test_returns_none_when_unset(self, bootstrap):
+        bootstrap.logs_client.describe_log_groups.return_value = {
+            'logGroups': [{'logGroupName': '/aws-glue/jobs/output'}]  # no retentionInDays
+        }
+        assert bootstrap._get_log_group_retention('/aws-glue/jobs/output') is None
+
+    def test_returns_none_when_group_absent(self, bootstrap):
+        bootstrap.logs_client.describe_log_groups.return_value = {'logGroups': []}
+        assert bootstrap._get_log_group_retention('/aws-glue/jobs/output') is None
+
+    def test_matches_exact_name_ignoring_prefix_siblings(self, bootstrap):
+        bootstrap.logs_client.describe_log_groups.return_value = {
+            'logGroups': [
+                {'logGroupName': '/aws-glue/jobs/output-2', 'retentionInDays': 7},
+                {'logGroupName': '/aws-glue/jobs/output', 'retentionInDays': 30},
+            ]
+        }
+        assert bootstrap._get_log_group_retention('/aws-glue/jobs/output') == 30
 
 
 # -- _prompt_for_role ---------------------------------------------------
@@ -850,6 +978,92 @@ class TestPromptForRole:
 
 
 # -- bootstrap() top-level orchestrator ---------------------------------
+
+class TestReportsResourcesLeftBehind:
+    """Issue #307: a bootstrap that dies mid-way must name what it created.
+
+    teardown resolves resources through the Glue job, so when bootstrap fails
+    before creating the job, teardown bails with "Unable to determine glue job
+    bucket name" and never reaches the role. The operator is left with a
+    high-privilege role and, without this, no indication it exists.
+    """
+
+    def _stub_steps(self, bootstrap, failing_step):
+        """Stub every bootstrap step; make `failing_step` exit(1)."""
+        for name in ('_add_glue_job_role', '_create_glue_log_groups',
+                     '_ensure_dynamodb_glue_connection', '_create_or_update_glue_job',
+                     '_upload_job_root_to_s3', 'update_python_modules_in_s3',
+                     '_upload_property_files_to_s3'):
+            setattr(bootstrap, name, MagicMock())
+        getattr(bootstrap, failing_step).side_effect = SystemExit(1)
+
+    def test_names_the_role_when_this_run_created_it(self, bootstrap, caplog):
+        import logging
+        self._stub_steps(bootstrap, '_create_glue_log_groups')
+        bootstrap._role_created_this_run = 'AWSGlueServiceRoleBulkDynamoDB-DdbReadOnly-eu-central-1'
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit):
+                bootstrap.bootstrap({})
+
+        errors = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors, "a failed bootstrap that created a role must say so"
+        assert 'AWSGlueServiceRoleBulkDynamoDB-DdbReadOnly-eu-central-1' in errors[-1]
+        assert 'left in place' in errors[-1]
+        assert 'teardown' in errors[-1], (
+            "must warn that teardown cannot clean this up -- that's the trap"
+        )
+        # One leftover -> singular. A message whose job is to be trusted
+        # shouldn't read like it has a bug in it.
+        assert 'which has been left in place' in errors[-1]
+        assert 'reuse it' in errors[-1]
+
+    def test_silent_when_the_role_already_existed(self, bootstrap, caplog):
+        """A pre-existing role was not ours to leak, so don't claim it."""
+        import logging
+        self._stub_steps(bootstrap, '_create_glue_log_groups')
+        # _role_created_this_run stays None -- bootstrap only found the role.
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit):
+                bootstrap.bootstrap({})
+
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR and 'left in place' in r.message
+        ], "must not report resources this run didn't create"
+
+    def test_names_both_role_and_bucket(self, bootstrap, caplog):
+        import logging
+        self._stub_steps(bootstrap, 'update_python_modules_in_s3')
+        bootstrap._role_created_this_run = 'AWSGlueServiceRole-x'
+        bootstrap._bucket_created_this_run = 'aws-glue-bulk-dynamodb-eu-central-1-1-abc'
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit):
+                bootstrap.bootstrap({})
+
+        msg = [r.message for r in caplog.records if r.levelno == logging.ERROR][-1]
+        assert 'AWSGlueServiceRole-x' in msg
+        assert 'aws-glue-bulk-dynamodb-eu-central-1-1-abc' in msg
+        # Two leftovers -> plural.
+        assert 'which have been left in place' in msg
+        assert 'reuse them' in msg
+
+    def test_silent_on_success(self, bootstrap, caplog):
+        import logging
+        for name in ('_add_glue_job_role', '_create_glue_log_groups',
+                     '_ensure_dynamodb_glue_connection', '_create_or_update_glue_job',
+                     '_upload_job_root_to_s3', 'update_python_modules_in_s3',
+                     '_upload_property_files_to_s3'):
+            setattr(bootstrap, name, MagicMock())
+        bootstrap._role_created_this_run = 'AWSGlueServiceRole-x'
+
+        with caplog.at_level(logging.ERROR):
+            bootstrap.bootstrap({})
+
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
 
 class TestBootstrapOrchestrator:
     def test_bootstrap_calls_each_step_in_order(self, bootstrap):
@@ -983,3 +1197,79 @@ class TestBootstrapInit:
         assert instance.s3_client is clients.s3_client
         assert instance.glue_client is clients.glue_client
         assert instance.logs_client is clients.logs_client
+
+
+class TestCustomRolesAreNotModified:
+    """A role the operator supplied belongs to the operator (regression from #326).
+
+    #326 made provisioning unconditional so a bootstrap-generated role is always
+    brought up to what the current version needs. Applied to a *custom* role that
+    silently widened it: a role deliberately built with describe-only DynamoDB
+    access came back from bootstrap holding AWSGlueServiceRole and
+    AmazonDynamoDBReadOnlyAccess plus three inline policies, so a role built to
+    have no table access could read every table in the account. Caught while using
+    such a role to test error handling -- the denial never happened because
+    bootstrap had granted the access.
+    """
+
+    def _custom(self, bootstrap):
+        bootstrap._prompt_for_role = MagicMock()
+        bootstrap._is_existing_role = MagicMock(return_value=True)
+        bootstrap._validated_custom_roles = {'MyOwnRole'}
+        return {'XRole': 'MyOwnRole'}
+
+    def test_no_policies_are_attached_to_a_custom_role(self, bootstrap):
+        bootstrap._add_glue_job_role(self._custom(bootstrap))
+        bootstrap.iam_client.attach_role_policy.assert_not_called()
+        bootstrap.iam_client.put_role_policy.assert_not_called()
+
+    def test_trust_policy_of_a_custom_role_is_untouched(self, bootstrap):
+        bootstrap._add_glue_job_role(self._custom(bootstrap))
+        bootstrap.iam_client.update_assume_role_policy.assert_not_called()
+        bootstrap.iam_client.create_role.assert_not_called()
+
+    def test_generated_roles_are_still_provisioned(self, bootstrap):
+        """The #326 behaviour must survive for roles bootstrap owns."""
+        from infrastructure.constants import ROLE_TYPE_READ_ONLY
+
+        class EntityAlreadyExistsException(Exception):
+            pass
+        bootstrap.iam_client.exceptions.EntityAlreadyExistsException = (
+            EntityAlreadyExistsException
+        )
+        bootstrap.iam_client.create_role.side_effect = EntityAlreadyExistsException()
+        bootstrap._prompt_for_role = MagicMock()
+
+        bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_ONLY})
+
+        bootstrap.iam_client.attach_role_policy.assert_called()
+        bootstrap.iam_client.put_role_policy.assert_called()
+
+    def test_operator_path_never_reaches_provisioning(self, bootstrap):
+        """Structural: the two paths share nothing.
+
+        Asserting on the seam rather than on its symptoms -- if a future edit lets
+        the operator path fall through again, this fails even if that edit happens
+        to attach nothing on the day.
+        """
+        bootstrap._provision_generated_role = MagicMock()
+        bootstrap._add_glue_job_role(self._custom(bootstrap))
+        bootstrap._provision_generated_role.assert_not_called()
+
+    def test_generated_path_delegates_to_provisioning(self, bootstrap):
+        from infrastructure.constants import ROLE_TYPE_READ_WRITE
+        bootstrap._prompt_for_role = MagicMock()
+        bootstrap._provision_generated_role = MagicMock()
+
+        bootstrap._add_glue_job_role({'XRole': ROLE_TYPE_READ_WRITE})
+
+        bootstrap._provision_generated_role.assert_called_once()
+        role_name = bootstrap._provision_generated_role.call_args.args[0]
+        assert 'DdbReadWrite' in role_name, role_name
+
+    def test_is_custom_role_classification(self, bootstrap):
+        from infrastructure.constants import ROLE_TYPE_READ_ONLY, ROLE_TYPE_READ_WRITE
+        assert bootstrap._is_custom_role({'XRole': 'SomeRole'}) is True
+        assert bootstrap._is_custom_role({'XRole': ROLE_TYPE_READ_ONLY}) is False
+        assert bootstrap._is_custom_role({'XRole': ROLE_TYPE_READ_WRITE}) is False
+        assert bootstrap._is_custom_role({}) is False, "no --XRole means we generate one"

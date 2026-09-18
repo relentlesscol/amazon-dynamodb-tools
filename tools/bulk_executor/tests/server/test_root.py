@@ -5,6 +5,10 @@ Covers `server/src/root.py`:
   (no exit, single-line exit, message after marker, multi-line traceback).
 - `_get_parsed_glue_job_args`: argv parsing for `--key value` pairs, optional
   flag-without-value handling, and the XDebug print-on-true branch.
+- Module-level warnings suppression: the "DataFrame constructor is internal"
+  UserWarning that awsglue's DynamicFrame.toDF() triggers is filtered once for
+  every verb, is registered before dispatch, and does not swallow unrelated
+  UserWarnings.
 - Module-level dispatcher logic: SparkContext/GlueContext/Job initialization,
   sys.path append, XAction → module name mapping (default + dash-to-underscore
   rewrite), logger init wiring, importlib import_module dispatch, the success
@@ -26,10 +30,28 @@ entries per-test so the side effects are observable.
 import importlib.util
 import sys
 import types
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+INTERNAL_DATAFRAME_WARNING = "DataFrame constructor is internal. Do not directly use it."
+
+
+def _filter_matches_internal_dataframe_warning():
+    """True when an active 'ignore' filter covers INTERNAL_DATAFRAME_WARNING.
+
+    Inspects warnings.filters rather than emitting the warning, because
+    warnings.catch_warnings(record=True) resets the filter list to
+    simplefilter("always") on entry and would mask the very filter under test.
+    """
+    for action, message, _category, _module, _lineno in warnings.filters:
+        if action == "ignore" and message is not None \
+                and message.match(INTERNAL_DATAFRAME_WARNING):
+            return True
+    return False
 
 
 # --- Constants & helpers ----------------------------------------------------
@@ -91,12 +113,18 @@ def _install_logger_stub(modules_to_install):
 
 
 def _install_bulk_executor_error_stub(modules_to_install):
-    """Provide a real exception class so `except BulkExecutorError` actually matches."""
+    """Expose the class the classifier itself holds, under the stubbed module path.
+
+    Not a fresh subclass. root.py now reports through shared/driver_errors.py, which asks
+    shared/worker_errors.py whether the failure is understood -- and that check is an
+    isinstance against the class *it* bound at import time. conftest registers both
+    `shared.` and `python_modules.shared.` over the same files, so importing the module
+    again can produce a second, distinct class; the isinstance would then miss and the
+    test would assert nothing about the branch it names.
+    """
+    from python_modules.shared.worker_errors import BulkExecutorError
+
     be_module = types.ModuleType("python_modules.shared.bulk_executor_error")
-
-    class BulkExecutorError(Exception):
-        pass
-
     be_module.BulkExecutorError = BulkExecutorError
     modules_to_install["python_modules.shared.bulk_executor_error"] = be_module
     return BulkExecutorError
@@ -121,6 +149,23 @@ def _load_root(monkeypatch, argv, verb_module=None, verb_name=None,
         logger_module = _install_logger_stub(install)
 
     BulkExecutorError = _install_bulk_executor_error_stub(install)
+
+    # tests/server/conftest.py replaces shared.errors with a Mock, so get_error_message
+    # would hand back a Mock repr and any assertion on the message text would be vacuous.
+    # driver_errors needs a working one to build the closing line.
+    errors_module = types.ModuleType("python_modules.shared.errors")
+    errors_module.get_error_message = lambda e: str(e)
+    errors_module.get_error_code = lambda e: None
+    errors_module.ListAccumulator = object
+    install["python_modules.shared.errors"] = errors_module
+
+    # shared/worker_errors.py holds the classifier root.py's reporting path uses, and it
+    # binds these two names at import time -- which already happened, against conftest's
+    # Mock. Installing a module above does not rebind them, so patch them where they are
+    # read or every assertion on message text is vacuous.
+    import python_modules.shared.worker_errors as _worker_errors
+    monkeypatch.setattr(_worker_errors, "get_error_message", lambda e: str(e))
+    monkeypatch.setattr(_worker_errors, "get_error_code", lambda e: None)
 
     # The verb module is what root.py imports via importlib.import_module.
     # If `import_should_fail` is set, we leave python_modules.<verb_name>
@@ -337,6 +382,80 @@ class TestRootInitialization:
         assert "python_modules" in sys.path
 
 
+class TestRootDataFrameWarningSuppression:
+    """The "DataFrame constructor is internal" filter (issue #290).
+
+    awsglue's DynamicFrame.toDF() calls pyspark's internal DataFrame
+    constructor, which emits a UserWarning that leaked into `load` output
+    because only find.py and sql.py declared their own filter. root.py now
+    registers it once for every verb.
+
+    Each test loads root.py inside `warnings.catch_warnings()` so the filter
+    root.py installs is torn down afterwards and cannot leak into other tests.
+    """
+
+    def test_filter_registered_for_internal_dataframe_warning(self, monkeypatch):
+        """root.py registers an 'ignore' filter matching the pyspark message."""
+        verb = _make_verb_module("copy")
+        with warnings.catch_warnings():
+            _load_root(monkeypatch,
+                       ["root.py", "--XAction", "copy"],
+                       verb_module=verb, verb_name="copy")
+            assert _filter_matches_internal_dataframe_warning()
+
+    def test_filter_registered_before_verb_run_is_called(self, monkeypatch):
+        """The filter must be active *by the time the verb runs*.
+
+        This is the invariant that broke for `load`: its
+        dynamicFrame.toDF() fires the warning inside run(), so a filter
+        registered any later than dispatch is useless.
+        """
+        observed = {}
+
+        def fake_run(job, sc, gc, parsed_args):
+            observed["active"] = _filter_matches_internal_dataframe_warning()
+
+        verb = _make_verb_module("load", run_callable=fake_run)
+        with warnings.catch_warnings():
+            _load_root(monkeypatch,
+                       ["root.py", "--XAction", "load"],
+                       verb_module=verb, verb_name="load")
+        assert observed["active"] is True, \
+            "filter must be registered before the verb's run() is dispatched"
+
+    def test_internal_dataframe_warning_is_actually_swallowed(self, monkeypatch):
+        """Behavioral: emitting the real message produces no output.
+
+        showwarning is patched rather than using catch_warnings(record=True),
+        which would reset the filters and mask what we're testing.
+        """
+        verb = _make_verb_module("copy")
+        with warnings.catch_warnings():
+            _load_root(monkeypatch,
+                       ["root.py", "--XAction", "copy"],
+                       verb_module=verb, verb_name="copy")
+            shown = []
+            with patch.object(warnings, "showwarning",
+                              lambda *args, **kwargs: shown.append(args)):
+                warnings.warn(INTERNAL_DATAFRAME_WARNING, UserWarning)
+            assert shown == []
+
+    def test_unrelated_user_warning_still_surfaces(self, monkeypatch):
+        """The filter is pinned to one message — it is not a blanket
+        UserWarning ignore, so genuine warnings still reach the user."""
+        verb = _make_verb_module("copy")
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            _load_root(monkeypatch,
+                       ["root.py", "--XAction", "copy"],
+                       verb_module=verb, verb_name="copy")
+            shown = []
+            with patch.object(warnings, "showwarning",
+                              lambda *args, **kwargs: shown.append(args)):
+                warnings.warn("a genuinely useful warning", UserWarning)
+            assert len(shown) == 1
+
+
 class TestRootLoggerInit:
     """Logger init wiring (lines 71-72)."""
 
@@ -485,23 +604,51 @@ class TestRootBulkExecutorErrorPropagation:
 
 
 class TestRootGenericExceptionPropagation:
-    """Generic Exception from a verb is re-raised (lines 88-89)."""
+    """A non-BulkExecutorError from a verb is reported, then exits (#332).
 
-    def test_generic_exception_propagates(self, monkeypatch):
-        """Lines 88-89: a non-BulkExecutorError exception is re-raised verbatim."""
+    It used to be re-raised, which handed the user Glue's exception-analysis blob and
+    Py4J's restatement of the same failure on top of the traceback. root.py now routes
+    everything through shared/driver_errors.py: the traceback is printed once for the
+    user, and the job exits with a one-line reason that becomes Glue's ErrorMessage.
+    """
+
+    def test_generic_exception_is_reported_then_exits(self, monkeypatch, capsys):
         run_mock = MagicMock(side_effect=RuntimeError("boom"))
         verb = _make_verb_module("copy", run_callable=run_mock)
-        with pytest.raises(RuntimeError, match="boom"):
+        with pytest.raises(SystemExit) as exc_info:
             _load_root(monkeypatch,
                        ["root.py", "--XAction", "copy"],
                        verb_module=verb, verb_name="copy")
 
+        reason = str(exc_info.value)
+        assert "boom" in reason, "the closing line names the failure"
+        assert "Traceback" not in reason, (
+            "the reason is Glue's ErrorMessage and the client's last line -- keep it to one"
+        )
+        out = capsys.readouterr().out
+        assert "did not expect" in out and "Traceback" in out, (
+            "an unexpected failure prints its traceback where the user will see it"
+        )
+
+    def test_a_verbs_own_exit_passes_straight_through(self, monkeypatch, capsys):
+        """A helper that already called exit() has said its piece. Re-reporting it would
+        relabel a deliberate exit as a surprise and print a traceback for it."""
+        run_mock = MagicMock(side_effect=SystemExit("PITR must be enabled first"))
+        verb = _make_verb_module("copy", run_callable=run_mock)
+        with pytest.raises(SystemExit) as exc_info:
+            _load_root(monkeypatch,
+                       ["root.py", "--XAction", "copy"],
+                       verb_module=verb, verb_name="copy")
+
+        assert str(exc_info.value) == "PITR must be enabled first", "unchanged, not re-wrapped"
+        assert "did not expect" not in capsys.readouterr().out
+
     def test_generic_exception_skips_commit_and_stop(self, monkeypatch):
-        """Lines 93-94: exception path bypasses job.commit() and spark.stop()."""
+        """A failed job must not be committed -- that is what makes Glue mark it FAILED."""
         run_mock = MagicMock(side_effect=ValueError("nope"))
         verb = _make_verb_module("copy", run_callable=run_mock)
         awsglue = _build_awsglue_stubs()
-        with pytest.raises(ValueError):
+        with pytest.raises(SystemExit):
             _load_root(monkeypatch,
                        ["root.py", "--XAction", "copy"],
                        verb_module=verb, verb_name="copy",

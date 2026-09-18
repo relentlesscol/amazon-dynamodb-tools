@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import threading
 import time
@@ -11,6 +12,12 @@ from botocore.exceptions import (
     EventStreamError,
     HTTPClientError
 )
+# Reads from a live-tail event stream happen outside botocore's request layer, so
+# a mid-stream read timeout or dropped connection surfaces as the raw urllib3
+# exception rather than a botocore ConnectionError/HTTPClientError. We add these to
+# the transient-error bucket so the watcher reconnects instead of silently dying
+# (see _watch_log_group). urllib3 is a hard dependency of botocore.
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
 # project files
 from clients import Clients
 from infrastructure import GLUE_JOB_NAME, GlueJobDefaults
@@ -31,6 +38,13 @@ TIMEOUT_STATE = 'TIMEOUT'
 LIVE_TAIL_MAX_RETRIES = 20
 LIVE_TAIL_RETRY_WAIT_TIME_IN_SECONDS = 2
 
+# Server-side logs are formatted as "<asctime> <LEVELNAME> [<thread>] <name> - <msg>"
+# by BulkDynamoDBServerSideFormatter, where asctime is the logging default
+# "YYYY-MM-DD HH:MM:SS,mmm". We anchor on that exact leading shape to read the
+# real log level and color by it, rather than guessing from keywords in the body.
+# Group 1 is the level token (WARNING, ERROR, INFO, ...).
+_SERVER_LOG_LEVEL_RE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} (\w+)\b')
+
 # Logs are streamed every second, so no need for a wait timer (count alone is sufficient).
 LIVE_TAIL_SUCCESS_SHUTDOWN_MAX_COUNT = 3 # Complete the job after this many counts of no additional logs coming through.
 
@@ -40,6 +54,19 @@ TERMINAL_JOB_STATES = set([
     TIMEOUT_STATE
 ])
 
+# Markers the job prints when it has already told the user what went wrong: a
+# BulkExecutorError sentence, or a traceback that names the offending line -- from a
+# worker or from the driver. Either way Glue's exception analysis adds nothing but volume
+# afterwards, and for a driver-side failure it also restates the same error through Py4J.
+# The last two must match worker_errors.UNEXPECTED_FAILURE_BANNER and
+# driver_errors.UNEXPECTED_FAILURE_BANNER (a guard test checks both).
+JOB_EXPLAINED_THE_FAILURE = (
+    'BulkExecutorError',
+    'A worker failed in a way we did not expect. Traceback from the worker:',
+    'The job failed in a way we did not expect. Traceback:',
+    'Bulk Executor failure: ',
+)
+
 # Timing constants
 WAIT_TIME_SECONDS = 0.5 # Time to wait before checking job run state again (in seconds)
 
@@ -48,6 +75,14 @@ class BulkDynamoDbRunner:
         self.aws_region = env_configs.aws_region
         self.aws_account_id = env_configs.aws_account_id
         self._suppress_glue_noise = False
+        # Counted rather than silently dropped: see utils.COUNTED_NOISE_PATTERNS. Written
+        # from the live-tail threads, read once at the end, so it takes the lock.
+        self._suppressed_noise = {}
+        self._suppressed_noise_lock = threading.Lock()
+        # The signal that made us stop the job: the closing line names it, and its presence
+        # is also how we know the advice has already been given. Both live-tail threads can
+        # match; whichever stores first wins, and either is a true account of the run.
+        self._unhealthy_signal_seen = None
 
         clients = Clients(self.aws_region)
         self.dynamodb_client = clients.dynamodb_client
@@ -105,9 +140,23 @@ class BulkDynamoDbRunner:
         elif any(key in log_message for key in utils.LOG_PATTERN_IGNORE_LIST):
             return # Skip known noisy log patterns
 
-        # When a BulkExecutorError has been seen, suppress subsequent Glue exception analysis noise
-        # This allows us to show the end user the core underlying error/exception message without it being drowned in a sea of "red" Glue errors
-        if 'BulkExecutorError' in log_message:
+        noise_label = next((label for pattern, label in utils.COUNTED_NOISE_PATTERNS
+                            if pattern in log_message), None)
+        if noise_label:
+            # Known Glue/Spark noise. Hidden so a successful run does not print red, but
+            # counted so the closing summary can say something was withheld -- silently
+            # eating error-shaped output would leave anyone debugging a real problem
+            # misled about what the run actually said.
+            with self._suppressed_noise_lock:
+                self._suppressed_noise[noise_label] = self._suppressed_noise.get(noise_label, 0) + 1
+            return
+
+        # Once the job has explained the failure itself, suppress the Glue exception
+        # analysis noise that follows. This allows us to show the end user the core
+        # underlying error/exception message without it being drowned in a sea of "red"
+        # Glue errors -- including, for an unexpected failure, a Glue traceback of our
+        # own plumbing on top of the worker traceback that names the actual line.
+        if any(marker in log_message for marker in JOB_EXPLAINED_THE_FAILURE):
             self._suppress_glue_noise = True
         if self._suppress_glue_noise and ('GlueExceptionAnalysisListener' in log_message or 'Error Category:' in log_message):
             return
@@ -120,28 +169,59 @@ class BulkDynamoDbRunner:
             # Non-output logs can decorate with what special non-output place they came from
             formatted_message = f'[{log_group}] {self._jsonify_message(log_message)}'
 
-        # Pretty print useful info w/ console coloring for easier readability
-        # Should this stuff not be using log.error() and so on?
-        # end='' prevents newlines which is important since messages can be in multiple events
-        # Really we should be buffering til we hit a newline
+        # Pretty print useful info w/ console coloring for easier readability.
+        # end='' prevents newlines which is important since messages can be in multiple events.
+        #
+        # Coloring precedence:
+        #   1. CONFIG keys -> gray. Checked first so external-lib noise pinned to
+        #      WARNING level (botocore/urllib3, e.g. "...timeout=30...") stays
+        #      de-emphasized rather than turning yellow via the level check below.
+        #   2. Real server log level, read from the leading "<asctime> <LEVEL>"
+        #      prefix. This is the reliable signal: the level is positionally fixed
+        #      by the server formatter, unlike keyword guesses on the body. A line
+        #      like a WARNING that merely contains the word "exception" is now
+        #      correctly yellow instead of red.
+        #   3. Keyword fallback for lines that don't carry our level prefix (e.g.
+        #      raw Spark/log4j lines with a different timestamp format).
+        #
+        # INVARIANT this relies on: verb output directed at the terminal (find item
+        # JSON, sql rows, count/scancount numbers, etc.) never begins with a line
+        # matching _SERVER_LOG_LEVEL_RE ("YYYY-MM-DD HH:MM:SS,mmm <WORD>"). Such
+        # output shares the output log group with server diagnostics, and only the
+        # leading-prefix shape distinguishes the two. Today no verb emits data in
+        # that shape. If a future verb streams data that could, those lines would be
+        # mis-colored (or, for a data line beginning with an ERROR-like token,
+        # wrongly routed to stderr) -- revisit this block if so.
+        level_match = _SERVER_LOG_LEVEL_RE.match(log_message)
+        level = level_match.group(1) if level_match else None
+
         if any(key in log_message.lower() for key in utils.CONFIG_LOG_MESSAGE_KEYS):
             print(ColorCodes.GRAY + formatted_message + ColorCodes.RESET, end='')
+        elif level in ('ERROR', 'CRITICAL'):
+            print(ColorCodes.PINK + formatted_message + ColorCodes.RESET, file=sys.stderr, end='')
+        elif level == 'WARNING':
+            print(ColorCodes.YELLOW + formatted_message + ColorCodes.RESET, end='')
         elif any(key in log_message.lower() for key in utils.STD_ERROR_MESSAGE_KEYS):
             print(ColorCodes.PINK + formatted_message + ColorCodes.RESET, file=sys.stderr, end='')
-        elif any(key in log_message.lower() for key in utils.WARN_LOG_MESSAGE_KEYS):
-            print(ColorCodes.YELLOW + formatted_message + ColorCodes.RESET, end='')
 
         else:
             print(formatted_message, end='') # not our job to add newlines
 
-    def _is_job_state_unhealthy(self, log_event):
-        """
-        Review all Log Groups for any log events that indicate the job is in an unhealthy state.
+    def _unhealthy_signal(self, log_event):
+        """Return the UnhealthySignal this log event matches, or None.
+
+        Reviews all Log Groups for any log events that indicate the job is in an unhealthy
+        state. The signal is returned rather than a bool so the caller can tell the user
+        what was seen: we stop the job on the strength of this line, and a stopped run
+        carries no reason of its own.
 
         WARNING: This may not work as expected if certain log groups are disabled (ex. '/jobs/error')
                  since that may be where the useful unhealthy log events are generated.
         """
-        return any(key in log_event['message'] for key in utils.UNHEALTHY_STATE_LOG_MESSAGE_KEYS)
+        for signal in utils.UNHEALTHY_STATE_LOG_SIGNALS:
+            if signal.pattern in log_event['message']:
+                return signal
+        return None
 
     def _wait_for_log_groups_to_exist(self, log_group_arns):
         """
@@ -183,13 +263,24 @@ class BulkDynamoDbRunner:
         """
         log_group_name = log_group_arn.split(':')[-1]
         log.debug(f"Starting live tail for log group: {log_group_name}")
-        
+
         # Wait for this specific log group to exist
         self._wait_for_log_groups_to_exist([log_group_arn])
-        
+
         succeeded_counter = 0
         reassembler = GlueLogReassembler()  # Each thread gets its own reassembler
-        
+
+        # Subscribe by stream-name prefix -- matches the driver stream
+        # ("<job_run_id>") and the per-executor streams ("<job_run_id>_g-*").
+        # Prefix (not exact name) is deliberate: the driver stream is created only
+        # once the job starts writing, and an exact-name subscription made before
+        # then fails with ResourceNotFoundException. Each batch is split by stream
+        # in the sessionUpdate handler below: the driver stream is the user-facing
+        # output (find/diff/sql results, counts) and is reassembled + printed;
+        # executor streams are framework/task noise that we never print and never
+        # feed to the reassembler (so their bytes can't be concatenated onto a
+        # dangling driver line and mislabeled -- issue #284), but every event is
+        # still scanned for fatal signals.
         while True:
             try:
                 # Start (or restart) live tail for this specific log group, https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs_LiveTail.html
@@ -214,13 +305,31 @@ class BulkDynamoDbRunner:
                     elif 'sessionUpdate' in event:
                         log_events = event['sessionUpdate']['sessionResults']
 
-                        # Add to reassembler and process ready events
-                        reassembled_events = reassembler.process(log_events)
+                        # Split by stream. The driver stream (no "_g-") is the
+                        # user-facing output: reassemble it and print. Executor
+                        # streams ("_g-") stay out of the reassembler entirely (so
+                        # they can't be merged onto a dangling driver line) and are
+                        # never printed -- but they still go through the health check.
+                        driver_events = [e for e in log_events if "_g-" not in e.get('logStreamName', '')]
+                        executor_events = [e for e in log_events if "_g-" in e.get('logStreamName', '')]
 
-                        for log_event in reassembled_events:
+                        printed_events = reassembler.process(driver_events)
+                        for log_event in printed_events:
                             self._pretty_print_log_event(log_event)
-                            if self._is_job_state_unhealthy(log_event):
-                                log.error(f"Logs from {log_group_name} indicate the Glue Job is unhealthy! Shutting down...")
+
+                        # Shortcut detector: driver records (reassembled) + raw
+                        # executor events -- i.e. everything, printed or not.
+                        for log_event in [*printed_events, *executor_events]:
+                            signal = self._unhealthy_signal(log_event)
+                            if signal:
+                                # Said here, in full, because this is the only place that
+                                # knows why: the stop turns the run into a Glue STOPPED
+                                # with no ErrorMessage, and the executor stream the line
+                                # came from is never printed.
+                                self._unhealthy_signal_seen = self._unhealthy_signal_seen or signal
+                                log.error(f"Stopping the job: {signal.summary}.")
+                                log.error(signal.advice)
+                                log.debug(f"Matched {signal.pattern!r} in {log_group_name}")
                                 job_unhealthy_event.set()
                                 self._stop_glue_job(job_run_id)
                                 return
@@ -246,11 +355,30 @@ class BulkDynamoDbRunner:
 
                 return  # Clean exit
 
-            except (ConnectionError, HTTPClientError, EventStreamError) as e:
+            # A dropped session is a hole in the output, not just a hiccup. Live Tail
+            # only delivers what is ingested while a session is open and never
+            # backfills, so every log line CloudWatch ingested between the drop and
+            # the new session is gone from the console for good. It is still in
+            # CloudWatch Logs, which is why both messages below point there. These
+            # are warnings rather than debug because the user cannot otherwise tell a
+            # complete run from a truncated one -- the job still reports success.
+            except (ConnectionError, HTTPClientError, EventStreamError, ReadTimeoutError, ProtocolError) as e:
                 job_run_state = self._get_job_run_state(job_run_id)
                 if job_run_state in TERMINAL_JOB_STATES or job_run_state == SUCCEEDED_STATE or job_unhealthy_event.is_set():
-                    return  # Job is done, no need to reconnect
-                log.debug(f"Live tail session for {log_group_name} expired or failed ({e}), reconnecting...")
+                    # Nothing to reconnect for, but the session died instead of
+                    # closing cleanly, so anything not yet delivered is lost. Flush
+                    # what the reassembler is still holding before giving up.
+                    for log_event in reassembler.flush():
+                        self._pretty_print_log_event(log_event)
+                    log.warning(
+                        f"Live tail for {log_group_name} dropped as the job finished "
+                        f"({type(e).__name__}). Any output not yet delivered is "
+                        f"missing above -- see CloudWatch Logs for the full output.")
+                    return
+                log.warning(
+                    f"Live tail for {log_group_name} dropped and is reconnecting "
+                    f"({type(e).__name__}). Output from the gap is not redelivered, so "
+                    f"some lines may be missing -- see CloudWatch Logs for the full output.")
                 time.sleep(1)
             except Exception as e:
                 log.error(f"Unexpected error occurred in {log_group_name} live tail: {str(e)}.")
@@ -300,6 +428,27 @@ class BulkDynamoDbRunner:
         except Exception as e:
             log.error(f'Error getting job run ErrorMessage! {e}')
             exit(f"Error getting job run ErrorMessage {e}")
+
+    def _report_suppressed_noise(self):
+        """Say what was withheld, once, just above the closing line.
+
+        Deliberately a warning rather than an error: the run may well have succeeded, and
+        these messages are Glue's or Spark's. The point is that a user who suspects
+        something went wrong learns the console was not the whole story.
+        """
+        with self._suppressed_noise_lock:
+            counts = dict(self._suppressed_noise)
+        if not counts:
+            return
+
+        total = sum(counts.values())
+        detail = ', '.join(f"{count} x {label}" for label, count in
+                           sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        log.warning(
+            f"{total} known Glue/Spark {'message' if total == 1 else 'messages'} "
+            f"({detail}) {'was' if total == 1 else 'were'} not displayed. They are noise "
+            f"on a healthy run; if this job looks wrong, the full output is in CloudWatch "
+            f"under /aws-glue/jobs/output.")
 
     def _get_job_run_dpu(self, job_run_id, args):
         try:
@@ -386,13 +535,18 @@ class BulkDynamoDbRunner:
                 error_response = e.response.get('Error')
                 if error_response:
                     error_code = error_response.get('Code')
+            # elif, not a second if. Behavior is unchanged -- exit() raises
+            # SystemExit, so the first branch already terminated before the
+            # second was ever evaluated -- but the if/if/else shape read like a
+            # bug where the else swallowed ExpiredTokenException, and was
+            # recorded as one in AGENTS.md for months. It would also *become*
+            # that bug the moment someone changed an exit() to a log call.
             if error_code == 'ExpiredTokenException':
                 exit(f"Auth Credentials failed with an ExpiredTokenException! {e}")
-            if error_code == 'EntityNotFoundException':
+            elif error_code == 'EntityNotFoundException':
                 exit(f"Could not find the Glue job 'bulk_dynamodb' in account '{self.aws_account_id}' in region '{self.aws_region}', perhaps you need to run bootstrap...")
             else:
                 exit(f"Unhandled Exception! {e}")
-            exit(e) # could be smarter?
 
     def _stop_glue_job(self, job_run_id):
         try:
@@ -486,24 +640,43 @@ You can run the script with the --XWaitForDPU parameter in order to print the us
         job_run_state = self._get_job_run_state(job_run_id)
         job_run_error_message = self._get_job_run_error_message(job_run_id)
 
-        # Only SUCCEEDED is a clean exit; every other terminal state is a
-        # failure the caller must be able to detect via the process exit code
-        # (issue #137: a failed job must "show the effort failed", not exit 0).
+        # Only SUCCEEDED is a clean exit; every other terminal state is a failure
+        # the caller must be able to detect via the process exit code (issue #137:
+        # a failed job must "show the effort failed", not exit 0). `job_failed`
+        # drives that exit code. `final_log` additionally picks how the closing
+        # line is colored so the outcome is visible, not just stated in text: a
+        # user-interrupted stop is a yellow warning (expected, not broken), a
+        # genuine failure/timeout is a red error, and success stays plain INFO.
+        #
+        # A stop we initiated is a failure wearing a stop's clothes: Glue reports STOPPED
+        # with no ErrorMessage either way, so without this the closing line for a job that
+        # ran out of memory read "Job was stopped." in warning yellow -- the same thing
+        # Ctrl+C prints, and the last word on a run whose reason was never stated.
         job_end_message = None
         job_failed = True
-        if job_run_state == STOPPING_STATE:
+        final_log = log.info
+        stopped_because = self._unhealthy_signal_seen
+        if job_run_state in (STOPPING_STATE, STOPPED_STATE) and stopped_because:
+            job_end_message = f"Job failed: {stopped_because.summary}."
+            final_log = log.error
+        elif job_run_state == STOPPING_STATE:
             job_end_message = "Job is stopping."
+            final_log = log.warning
         elif job_run_state == STOPPED_STATE:
             job_end_message = "Job was stopped."
+            final_log = log.warning
         elif job_run_state == FAILED_STATE:
             job_end_message = "Job failed."
+            final_log = log.error
         elif job_run_state == TIMEOUT_STATE:
             job_end_message = "Job timed out."
+            final_log = log.error
         elif job_run_state == SUCCEEDED_STATE:
             job_end_message = "Job completed successfully."
             job_failed = False
         else:
-            log.error(f"Unhandled Job State: {job_run_state}")
+            job_end_message = f"Job ended in an unexpected state: {job_run_state}."
+            final_log = log.error
 
         job_end_time = datetime.now()
         job_duration = job_end_time - job_start_time
@@ -511,14 +684,24 @@ You can run the script with the --XWaitForDPU parameter in order to print the us
         dpu_seconds = self._get_job_run_dpu(job_run_id, args)
         dpu_hours = dpu_seconds / 3600
 
+        self._report_suppressed_noise()
+
         # Usually this is 0.0 unless we've waited for DPUs to arrive
         if dpu_hours > 0.0:
-            log.info(f"{job_end_message} Job duration: {str(job_duration).split('.')[0]} ({dpu_hours:.2f} DPU hours)")
+            final_log(f"{job_end_message} Job duration: {str(job_duration).split('.')[0]} ({dpu_hours:.2f} DPU hours)")
         else:
-            log.info(f"{job_end_message} Job duration: {str(job_duration).split('.')[0]}")
+            final_log(f"{job_end_message} Job duration: {str(job_duration).split('.')[0]}")
 
         if job_run_error_message:
             log.error(job_run_error_message)
+            # The other way a memory failure reaches the user: the watchdog matched nothing
+            # (a driver can die before it logs anything), but Glue's own closing message says
+            # OUT_OF_MEMORY_ERROR. Without this that run ends on Glue's sentence and no hint
+            # of what to change. Skipped when a signal did fire, because the advice was
+            # printed at detection and saying it twice reads as two problems.
+            if (not self._unhealthy_signal_seen
+                    and any(m in job_run_error_message for m in utils.MEMORY_FAILURE_MARKERS)):
+                log.error(utils.MEMORY_ADVICE)
 
         # Propagate failure to the process exit code so callers (and the shell)
         # can detect it. The Glue-side error message has already been printed.

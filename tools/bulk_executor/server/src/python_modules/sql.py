@@ -1,5 +1,4 @@
 import sys
-import warnings
 import boto3
 from pyspark.sql import SparkSession
 
@@ -8,6 +7,7 @@ sys.path.append('/server/src')
 from python_modules.shared.pricing import PricingUtility
 from python_modules.shared.table_info import get_and_print_dynamodb_table_info, get_dynamodb_throughput_configs, get_and_print_table_scan_cost
 from python_modules.shared.glue_connector import read_dynamodb_dataframe
+from python_modules.shared.bulk_executor_error import BulkExecutorError
 from python_modules.shared.errors import *
 
 def run(job, spark_context, glue_context, parsed_args):
@@ -21,8 +21,8 @@ def run(job, spark_context, glue_context, parsed_args):
     table_info = get_and_print_dynamodb_table_info(DYNAMO_DB_TABLE_NAME)
     _ = get_and_print_table_scan_cost(table_info, region_name)
 
-    # Suppress dataframe.py warning
-    warnings.filterwarnings("ignore", message="DataFrame constructor is internal. Do not directly use it.")
+    # The "DataFrame constructor is internal" warning is suppressed once in
+    # server/src/root.py for every verb.
 
     # Read directly into a DataFrame and register as temp table
     records = read_dynamodb_dataframe(
@@ -38,22 +38,20 @@ def run(job, spark_context, glue_context, parsed_args):
         # Validate query starts with SELECT for safety
         query_upper = QUERY.upper().strip()
         if not query_upper.startswith('SELECT'):
-            raise Exception("Only SELECT queries are supported")
-            
+            raise BulkExecutorError("Only SELECT queries are supported")
+
         # Execute the SQL query
         result = spark.sql(QUERY)
-        
+
         # Apply limit if specified
         if LIMIT:
             try:
                 limit = int(LIMIT)
-                if limit <= 0:
-                    raise ValueError("Limit must be positive")
-                result = result.limit(limit)
-            except ValueError as e:
-                raise Exception(f"Invalid 'limit': {str(e)}") from None
-            except Exception as e:
-                raise Exception("Invalid 'limit': " + get_error_message(e)) from None
+            except (ValueError, TypeError):
+                raise BulkExecutorError(f"Invalid 'limit': {LIMIT!r} is not an integer") from None
+            if limit <= 0:
+                raise BulkExecutorError(f"Invalid 'limit': must be positive, got {limit}")
+            result = result.limit(limit)
         
         # Cache the result for multiple actions
         result.cache()
@@ -89,8 +87,13 @@ def run(job, spark_context, glue_context, parsed_args):
         # Ensure proper cleanup
         result.unpersist()
         
+    except BulkExecutorError:
+        # Already a clean sentence (e.g. from a --limit check); surface it as-is.
+        raise
     except Exception as e:
-        raise Exception("SQL query error: " + get_error_message(e)) from None
+        # Wrap so root.py exits with one line and no traceback; get_error_message already
+        # returns a standalone sentence, so it needs no prefix.
+        raise BulkExecutorError(get_error_message(e)) from None
     finally:
         # Ensure Spark session cleanup
         try:

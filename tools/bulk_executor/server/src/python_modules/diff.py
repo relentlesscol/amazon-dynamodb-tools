@@ -8,11 +8,14 @@ from boto3 import Session
 from botocore.config import Config
 
 sys.path.append('/server/src')
-from python_modules.shared.errors import get_error_message
+from python_modules.shared.bulk_executor_error import BulkExecutorError
+from python_modules.shared.errors import ListAccumulator, get_error_message
 from python_modules.shared.table_info import (
     get_and_print_dynamodb_table_info,
     get_and_print_table_scan_cost,
-    get_dynamodb_throughput_configs
+    get_dynamodb_throughput_configs,
+    _region_from_table_ref,
+    _default_region
 )
 
 from python_modules.shared.rate_limiter import (
@@ -20,8 +23,25 @@ from python_modules.shared.rate_limiter import (
     RateLimiterSharedConfig,
     RateLimiterWorker
 )
+from python_modules.shared.worker_errors import (
+    raise_first_worker_error,
+    record_worker_failure
+)
 
-PRINT_LIMIT = 100
+# Console preview cap. Output reaches the client through CloudWatch Live Tail,
+# which tops out around 500 messages/sec at ~1KB each (~500KB/s) and samples/drops
+# beyond that. Printing many full items -- especially large ones -- can exceed that
+# ceiling and silently lose output, so we print only a small preview here and write
+# the complete diff to S3. See issue #86 / #280.
+CONSOLE_PREVIEW_LIMIT = 10
+
+# How far one stream may run ahead of the other while looking for a shared partition key.
+#
+# When the two scans drift, diff_segment peeks ahead until it finds a pk on both sides, and
+# the peeked items buffer in memory. We want a ceiling we hit before memory runs out, so a
+# disjoint pair stops with a clear message instead of OOMing a worker (#356/#358). 30,000
+# should fit the usual worker for most item sizes; very large items can still exceed it.
+MAX_LOOKAHEAD_ITEMS = 30_000
 
 class BinaryAwareEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles bytes objects by converting them to base64-encoded strings."""
@@ -31,7 +51,7 @@ class BinaryAwareEncoder(json.JSONEncoder):
         return super().default(obj)
 
 class SegmentStream:
-    def __init__(self, session, table_name, segment, total_segments, consistent_read, pk, sk):
+    def __init__(self, session, table_name, segment, total_segments, consistent_read, pk, sk, region_name=None):
         self.segment = segment
         self.total_segments = total_segments
         self.consistent_read = consistent_read
@@ -41,15 +61,23 @@ class SegmentStream:
         self.table_name = table_name
 
         # use the low level Client API so that Items can be compared easily later
-        # as they are built entirely of strings
-        self.dynamodb = session.client('dynamodb', config=Config(
-            connect_timeout=4.0,
-            read_timeout=4.0,
-            retries={
-                'mode': 'standard',
-                'total_max_attempts': 50
-            }
-        ))
+        # as they are built entirely of strings. The client (not the rate
+        # limiter's session) carries the region, so a cross-region ARN table is
+        # scanned in its own region while the rate limiter's S3 coordination
+        # stays in the bootstrap region.
+        client_kwargs = {
+            'config': Config(
+                connect_timeout=4.0,
+                read_timeout=4.0,
+                retries={
+                    'mode': 'standard',
+                    'total_max_attempts': 50
+                }
+            )
+        }
+        if region_name:
+            client_kwargs['region_name'] = region_name
+        self.dynamodb = session.client('dynamodb', **client_kwargs)
 
         self.pk = pk
         self.sk = sk
@@ -57,6 +85,15 @@ class SegmentStream:
 
     def _load_page(self):
         if self.last_page: return
+
+        # Checked before the scan, against the buffer as it stands after everything consumed
+        # so far -- so a stream read in step, which drains to one item before each load, never
+        # trips it however long the segment.
+        if len(self.items) >= MAX_LOOKAHEAD_ITEMS:
+            raise BulkExecutorError(
+                f"Tables are too different to diff accurately: in segment {self.segment} the "
+                f"two comparing scans ran {MAX_LOOKAHEAD_ITEMS:,} items apart without finding "
+                f"a matching partition key in both.")
 
         kwargs={
             'TableName' : self.table_name,
@@ -154,7 +191,7 @@ def log_diff(symbol, stream, concise_format):
         return f"{symbol} {json.dumps(ordered, separators=(',', ': '), cls=BinaryAwareEncoder)}"
 
 
-def diff_segment(stream_a_name, stream_b_name, monitor_options_a, monitor_options_b, segment, total_segments, consistent_read, concise_format, job_id, use_s3, bucket, schema_broadcast, rate_limiter_shared_config):
+def diff_segment(stream_a_name, stream_b_name, monitor_options_a, monitor_options_b, segment, total_segments, consistent_read, concise_format, job_id, bucket, schema_broadcast, rate_limiter_shared_config, error_accumulator):
     rate_limiter_worker_a = RateLimiterWorker(
         shared_config=rate_limiter_shared_config,
         **monitor_options_a
@@ -167,9 +204,16 @@ def diff_segment(stream_a_name, stream_b_name, monitor_options_a, monitor_option
 
     schema = schema_broadcast.value
 
+    # Talk to the right region if a table is given as an ARN pointing elsewhere;
+    # otherwise fall back to the session's (bootstrap) region.
+    session_a = rate_limiter_worker_a.get_session()
+    session_b = rate_limiter_worker_b.get_session()
+    table1_region = _region_from_table_ref(stream_a_name) or session_a.region_name
+    table2_region = _region_from_table_ref(stream_b_name) or session_b.region_name
+
     try:
-        stream_a = SegmentStream(rate_limiter_worker_a.get_session(), stream_a_name, segment, total_segments, consistent_read, pk=schema['table1']['pk'], sk=schema['table1']['sk'])
-        stream_b = SegmentStream(rate_limiter_worker_b.get_session(), stream_b_name, segment, total_segments, consistent_read, pk=schema['table2']['pk'], sk=schema['table2']['sk'])
+        stream_a = SegmentStream(session_a, stream_a_name, segment, total_segments, consistent_read, pk=schema['table1']['pk'], sk=schema['table1']['sk'], region_name=table1_region)
+        stream_b = SegmentStream(session_b, stream_b_name, segment, total_segments, consistent_read, pk=schema['table2']['pk'], sk=schema['table2']['sk'], region_name=table2_region)
 
         diff = []
 
@@ -277,19 +321,24 @@ def diff_segment(stream_a_name, stream_b_name, monitor_options_a, monitor_option
         while not stream_b.is_finished():
             diff.append(log_diff('+', stream_b, concise_format))
             stream_b.advance()
+    except Exception as e:
+        # Record and return; the driver raises the first error after collect().
+        record_worker_failure(error_accumulator, e, f"Error in worker {segment}")
+        return 0, []
     finally:
         rate_limiter_worker_a.shutdown()
         rate_limiter_worker_b.shutdown()
 
-    if use_s3:
-        if diff:
-            boto3.client('s3').put_object(Body="\n".join(diff), Bucket=bucket, Key=f"{job_id}/{segment}.txt")
-        return len(diff)
+    # Always persist the full segment output to S3 (skip empty segments so we
+    # don't litter the bucket with zero-byte files -- see #183). The console only
+    # ever shows a bounded preview, so S3 is the complete, reliable copy (#86/#280).
+    if diff and bucket:
+        boto3.client('s3').put_object(Body="\n".join(diff), Bucket=bucket, Key=f"output/{job_id}/{segment}.txt")
 
-    return diff[0:PRINT_LIMIT]
+    return len(diff), diff[:CONSOLE_PREVIEW_LIMIT]
 
 def print_dynamodb_table_info(table_name, fraction=1.0):
-    region_name = boto3.Session().region_name
+    region_name = _region_from_table_ref(table_name) or _default_region()
     table_info = get_and_print_dynamodb_table_info(table_name)
     return get_and_print_table_scan_cost(table_info, region_name, fraction=fraction)
 
@@ -300,7 +349,6 @@ def run(job, spark_context, glue_context, parsed_args):
     table1 = parsed_args.get('table')
     table2 = parsed_args.get('table2')
     diff_type = parsed_args.get('format', 'keys') # keys or full
-    use_s3 = parsed_args.get('s3')
     job_id = parsed_args.get("JOB_RUN_ID")
     bucket = parsed_args.get('s3-bucket-name')
 
@@ -311,7 +359,7 @@ def run(job, spark_context, glue_context, parsed_args):
         segment_indices = sorted(random.sample(segment_indices, sample_size))
         true_fraction = sample_size / splits
         print()
-        percent = f"{true_fraction * 100:.10f}".rstrip('0').rstrip('.') + '%' # no zeros in decimal
+        percent = f"{true_fraction * 100:.3f}".rstrip('0').rstrip('.') + '%' # at most 3 decimals, no trailing zeros
         print(f"Sampling {percent} of segments ({sample_size} of {splits} total): {segment_indices}")
         print()
 
@@ -323,8 +371,10 @@ def run(job, spark_context, glue_context, parsed_args):
     print(f"TOTAL DynamoDB cost for scanning both tables (approx): ${total_cost:,.2f}")
     print()
 
-    schema1 = boto3.client("dynamodb").describe_table(TableName=table1)['Table']['KeySchema']
-    schema2 = boto3.client("dynamodb").describe_table(TableName=table2)['Table']['KeySchema']
+    table1_region = _region_from_table_ref(table1) or _default_region()
+    table2_region = _region_from_table_ref(table2) or _default_region()
+    schema1 = boto3.client("dynamodb", region_name=table1_region).describe_table(TableName=table1)['Table']['KeySchema']
+    schema2 = boto3.client("dynamodb", region_name=table2_region).describe_table(TableName=table2)['Table']['KeySchema']
 
     def extract_keys(schema):
         pk = next(e['AttributeName'] for e in schema if e['KeyType'] == 'HASH')
@@ -350,36 +400,40 @@ def run(job, spark_context, glue_context, parsed_args):
         job_run_id=job_id
     )
 
+    # The aggregator only does S3 coordination, which lives in the bootstrap
+    # region -- never regionalize it, even when the tables are cross-region.
+    error_accumulator = spark_context.accumulator([], ListAccumulator())
     rate_limiter_aggregator = RateLimiterAggregator(shared_config=rate_limiter_shared_config)
 
     monitor_options_1 = get_dynamodb_throughput_configs(parsed_args, table1, modes=("read"), format="monitor")
     monitor_options_2 = get_dynamodb_throughput_configs(parsed_args, table2, modes=("read"), format="monitor")
 
     try:
-        rdd2 = rdd.map(lambda worker_id: diff_segment(table1, table2, monitor_options_1, monitor_options_2, worker_id, splits, False, diff_type == 'keys', job_id, use_s3, bucket, broadcast_schema, rate_limiter_shared_config)).collect()
+        # Each segment returns (count, preview) -- the full count plus at most
+        # CONSOLE_PREVIEW_LIMIT lines -- so the driver never collects the entire
+        # diff into memory. The complete output lives in S3.
+        rdd2 = rdd.map(lambda worker_id: diff_segment(table1, table2, monitor_options_1, monitor_options_2, worker_id, splits, False, diff_type == 'keys', job_id, bucket, broadcast_schema, rate_limiter_shared_config, error_accumulator)).collect()
     except Exception as e:
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
         rate_limiter_aggregator.shutdown()
 
-    if use_s3:
-        total = sum(rdd2)
-        if total == 0:
-            print("No differences found")
-        else:
-            print(f"There are {total} differences. These can be found in files at s3://{bucket}/{job_id}/")
-    else:
-        count = 0
-        for e in rdd2:
-            for r in e:
-                if count < PRINT_LIMIT:
-                    print(r)
-                count = count + 1
+    raise_first_worker_error(error_accumulator)
 
-        if count == 0:
-            print("No differences found")
-        elif count <= PRINT_LIMIT:
-            print(f"There are {count} differences.")
+    total = sum(count for count, _ in rdd2)
+
+    if total == 0:
+        print("No differences found")
+    else:
+        preview = [line for _, segment_preview in rdd2 for line in segment_preview][:CONSOLE_PREVIEW_LIMIT]
+        if total <= CONSOLE_PREVIEW_LIMIT:
+            print(f"{total} differences:")
         else:
-            print(f"(output truncated). There are {count} differences, printed first {PRINT_LIMIT}. Use the --s3 flag to store them all in S3.")
+            print(f"First {CONSOLE_PREVIEW_LIMIT} of {total} differences:")
+        for line in preview:
+            print(line)
+        if total > CONSOLE_PREVIEW_LIMIT:
+            print(f"...and {total - CONSOLE_PREVIEW_LIMIT} more not printed")
+        print()
+        print(f"Wrote {total:,} differences to s3://{bucket}/output/{job_id}/")
     print()

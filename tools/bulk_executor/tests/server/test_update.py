@@ -21,6 +21,7 @@ import botocore.exceptions
 import pytest
 
 from python_modules import update as update_module
+from python_modules.shared import worker_errors
 
 # The update verb does `from python_modules.shared.errors import *` which yields
 # nothing from a Mock (no __all__). Inject the names so they exist at module level.
@@ -559,7 +560,7 @@ class TestUpdateDataPagination:
         updated_acc.add.assert_called_once_with(3)
 
     def test_scan_kwargs_include_segment_and_total(self, monkeypatch):
-        """Lines 117-121: scan_kwargs includes TableName, Segment, TotalSegments."""
+        """Lines 117-120: scan_kwargs includes Segment, TotalSegments (not TableName — the Table resource already knows its name)."""
         scan_kwargs_seen = []
         table = MagicMock()
 
@@ -576,7 +577,7 @@ class TestUpdateDataPagination:
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
         )
 
-        assert scan_kwargs_seen[0]['TableName'] == 'my-tbl'
+        assert 'TableName' not in scan_kwargs_seen[0]
         assert scan_kwargs_seen[0]['Segment'] == 7
         assert scan_kwargs_seen[0]['TotalSegments'] == 100
 
@@ -654,8 +655,10 @@ class TestUpdateDataClientErrors:
             'UpdateItem'
         )
 
-    def test_throttle_exception_exits(self, monkeypatch):
-        """Lines 137-138: ProvisionedThroughputExceededException calls exit()."""
+    def test_throttle_exception_is_recorded_as_understood(self, monkeypatch):
+        """Persistent throttling is a problem we can state in a sentence, and it must not
+        escape the worker: exit() raised SystemExit, which the worker's `except Exception`
+        cannot catch, so it cost four Spark retries before aborting the job."""
         table = _make_table_with_scan([{'Items': [{'id': 1}]}])
         table.update_item = MagicMock(
             side_effect=self._make_client_error('ProvisionedThroughputExceededException')
@@ -666,15 +669,22 @@ class TestUpdateDataClientErrors:
                             lambda e: e.response['Error']['Code'])
         monkeypatch.setattr(update_module, 'get_error_message', lambda e: str(e))
 
+        errors = []
         error_acc = MagicMock()
-        with pytest.raises(SystemExit):
-            update_module._update_data(
-                {}, 'tbl', lambda item: {'Key': item}, 0, 1,
-                MagicMock(), MagicMock(), MagicMock(), error_acc, MagicMock()
-            )
+        error_acc.add = MagicMock(side_effect=errors.extend)
 
-    def test_validation_exception_exits(self, monkeypatch):
-        """Lines 139-140: ValidationException calls exit() with message."""
+        # Must not raise.
+        update_module._update_data(
+            {}, 'tbl', lambda item: {'Key': item}, 0, 1,
+            MagicMock(), MagicMock(), MagicMock(), error_acc, MagicMock()
+        )
+
+        message, detail = errors[0]
+        assert 'Throttling observed despite massive retries' in message
+        assert detail is None, "throttling needs no traceback"
+
+    def test_validation_exception_is_recorded_as_understood(self, monkeypatch):
+        """A generator producing items the table's schema rejects, same treatment."""
         table = _make_table_with_scan([{'Items': [{'id': 1}]}])
         table.update_item = MagicMock(
             side_effect=self._make_client_error('ValidationException', 'bad schema')
@@ -685,12 +695,18 @@ class TestUpdateDataClientErrors:
                             lambda e: e.response['Error']['Code'])
         monkeypatch.setattr(update_module, 'get_error_message', lambda e: 'bad schema')
 
+        errors = []
         error_acc = MagicMock()
-        with pytest.raises(SystemExit):
-            update_module._update_data(
-                {}, 'tbl', lambda item: {'Key': item}, 0, 1,
-                MagicMock(), MagicMock(), MagicMock(), error_acc, MagicMock()
-            )
+        error_acc.add = MagicMock(side_effect=errors.extend)
+
+        update_module._update_data(
+            {}, 'tbl', lambda item: {'Key': item}, 0, 1,
+            MagicMock(), MagicMock(), MagicMock(), error_acc, MagicMock()
+        )
+
+        message, detail = errors[0]
+        assert 'Validation exception' in message and 'bad schema' in message
+        assert detail is None, "the generator's items are the problem, not our frames"
 
     def test_conditional_check_failed_increments_failed_count(self, monkeypatch):
         """Lines 141-143: ConditionalCheckFailedException prints and increments failed_count."""
@@ -714,8 +730,16 @@ class TestUpdateDataClientErrors:
         failed_acc.add.assert_called_once_with(2)
         updated_acc.add.assert_called_once_with(0)
 
-    def test_conditional_check_failed_prints_kwargs(self, monkeypatch, capsys):
-        """Line 142: prints the update_kwargs that caused the condition failure."""
+    def test_conditional_check_failed_logs_the_key_not_the_whole_kwargs(
+        self, monkeypatch, capsys
+    ):
+        """Logs the failing item's Key only.
+
+        It used to interpolate the entire update_kwargs -- key, expression and every
+        attribute value -- once per item, from a worker, on a run that succeeds. A
+        conditional update that matches few items is a normal outcome, so on a 2M-item
+        table that was ~600 MB of log nobody reads. See #319.
+        """
         table = _make_table_with_scan([{'Items': [{'id': 'x'}]}])
         table.update_item = MagicMock(
             side_effect=self._make_client_error('ConditionalCheckFailedException')
@@ -726,13 +750,50 @@ class TestUpdateDataClientErrors:
                             lambda e: e.response['Error']['Code'])
 
         update_module._update_data(
-            {}, 'tbl', lambda item: {'Key': {'id': 'x'}, 'CE': 'cond'}, 0, 1,
+            {}, 'tbl',
+            lambda item: {'Key': {'id': 'x'}, 'UpdateExpression': 'SET a = :v',
+                          'ExpressionAttributeValues': {':v': 'a very long value'}},
+            0, 1,
             MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()
         )
 
         out = capsys.readouterr().out
-        assert 'condition expression failed' in out
-        assert "{'Key': {'id': 'x'}, 'CE': 'cond'}" in out
+        assert "{'id': 'x'}" in out, "the key identifies which item failed"
+        assert 'UpdateExpression' not in out, "the expression is not per-item detail"
+        assert 'a very long value' not in out, "attribute values must not be logged"
+
+    def test_conditional_check_failures_are_capped_per_worker(self, monkeypatch, capsys):
+        """Only the first N failures are logged, but every one is counted.
+
+        There are 800 workers and this fires once per item, so an uncapped log is the
+        800x multiplier that made #319 a problem. The count still has to be exact --
+        the driver's summary line is the only part the user ever sees.
+        """
+        from python_modules.shared.failure_reporter import MAX_REPORTED_PER_PARTITION
+
+        items = [{'id': str(i)} for i in range(MAX_REPORTED_PER_PARTITION + 5)]
+        table = _make_table_with_scan([{'Items': items}])
+        table.update_item = MagicMock(
+            side_effect=self._make_client_error('ConditionalCheckFailedException')
+        )
+        rl = _make_rl_worker(table)
+        monkeypatch.setattr(update_module, 'RateLimiterWorker', MagicMock(return_value=rl))
+        monkeypatch.setattr(update_module, 'get_error_code',
+                            lambda e: e.response['Error']['Code'])
+        failed_acc = MagicMock()
+
+        update_module._update_data(
+            {}, 'tbl', lambda item: {'Key': item}, 0, 1,
+            MagicMock(), MagicMock(), failed_acc, MagicMock(), MagicMock()
+        )
+
+        out = capsys.readouterr().out
+        logged = [line for line in out.splitlines()
+                  if line.startswith('Update condition failed for')]
+        assert len(logged) == MAX_REPORTED_PER_PARTITION, (
+            f"expected {MAX_REPORTED_PER_PARTITION} logged failures, got {len(logged)}")
+        assert 'only the first' in out, "say once that logging stopped"
+        failed_acc.add.assert_called_once_with(len(items)), "all failures still counted"
 
     def test_unhandled_client_error_re_raises(self, monkeypatch):
         """Lines 144-146: unknown error code prints to stderr and re-raises."""
@@ -753,8 +814,9 @@ class TestUpdateDataClientErrors:
         )
 
         error_acc.add.assert_called_once()
-        msg = error_acc.add.call_args.args[0][0]
-        assert 'worker 5' in msg
+        message, detail = error_acc.add.call_args.args[0][0]
+        assert 'worker 5' in message
+        assert 'Traceback' in detail, "InternalServerError is not one we explain away"
 
     def test_unhandled_client_error_prints_to_stderr(self, monkeypatch, capsys):
         """Line 145: unhandled error printed to stderr."""
@@ -786,6 +848,8 @@ class TestUpdateDataErrorAccumulation:
         rl = _make_rl_worker(table)
         monkeypatch.setattr(update_module, 'RateLimiterWorker', MagicMock(return_value=rl))
         monkeypatch.setattr(update_module, 'get_error_message', lambda e: f'wrapped:{e}')
+        # shared.errors is a Mock in tests/server, so patch where worker_errors reads it.
+        monkeypatch.setattr(worker_errors, 'get_error_message', str)
 
         error_acc = MagicMock()
         update_module._update_data(
@@ -796,11 +860,14 @@ class TestUpdateDataErrorAccumulation:
         error_acc.add.assert_called_once()
         appended = error_acc.add.call_args.args[0]
         assert isinstance(appended, list) and len(appended) == 1
-        assert 'worker 7' in appended[0]
-        assert 'wrapped:' in appended[0]
+        message, detail = appended[0]
+        assert 'worker 7' in message
+        assert 'network fail' in message
+        assert 'Traceback' in detail, "a RuntimeError from scan is not one we understand"
 
-    def test_system_exit_from_throttle_captured(self, monkeypatch):
-        """Lines 137-138 + 152: exit() raises SystemExit caught by outer except."""
+    def test_throttle_does_not_escape_the_worker(self, monkeypatch):
+        """The regression this guards: exit() raises SystemExit, a BaseException, so the
+        worker's `except Exception` never saw it and Spark retried the task four times."""
         table = _make_table_with_scan([{'Items': [{'id': 1}]}])
         table.update_item = MagicMock(
             side_effect=botocore.exceptions.ClientError(
@@ -815,12 +882,12 @@ class TestUpdateDataErrorAccumulation:
         monkeypatch.setattr(update_module, 'get_error_message', lambda e: str(e))
 
         error_acc = MagicMock()
-        # SystemExit is a BaseException — the except Exception won't catch it
-        with pytest.raises(SystemExit):
-            update_module._update_data(
-                {}, 'tbl', lambda item: {'Key': item}, 0, 1,
-                MagicMock(), MagicMock(), MagicMock(), error_acc, MagicMock()
-            )
+        update_module._update_data(
+            {}, 'tbl', lambda item: {'Key': item}, 0, 1,
+            MagicMock(), MagicMock(), MagicMock(), error_acc, MagicMock()
+        )
+
+        error_acc.add.assert_called_once(), "recorded rather than raised"
 
 
 class TestUpdateDataShutdown:

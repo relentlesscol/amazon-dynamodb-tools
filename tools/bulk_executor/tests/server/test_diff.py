@@ -2,11 +2,13 @@
 
 Covers `python_modules/diff.py`:
 - BinaryAwareEncoder: bytes → base64 JSON encoding
-- SegmentStream: parallel-scan stream abstraction (pagination, peek, advance, key extraction)
+- SegmentStream: parallel-scan stream abstraction (pagination, peek, advance, key
+  extraction, and the bounded lookahead window that keeps a drifted diff from buffering
+  whole segments)
 - item_matches: JSON-based item comparison
 - format_item_with_keys_first: key ordering for display
 - log_diff: concise vs full format output
-- diff_segment: core segment diffing logic (same pk, different pk, alignment, s3 output)
+- diff_segment: core segment diffing logic (same pk, different pk, alignment, unconditional S3 write, bounded preview)
 - run(): argument wiring, sampling, schema broadcast, result printing
 """
 
@@ -24,6 +26,16 @@ _pyspark_sql_functions = MagicMock()
 sys.modules.setdefault('pyspark.sql.functions', _pyspark_sql_functions)
 
 from python_modules import diff as diff_module
+
+class _FakeAccumulator:
+    """Stands in for a Spark accumulator: workers only ever call add()."""
+
+    def __init__(self):
+        self.value = []
+
+    def add(self, v):
+        self.value.extend(v)
+
 
 if not hasattr(diff_module, 'get_error_message'):
     diff_module.get_error_message = lambda e: str(e)
@@ -222,6 +234,116 @@ class TestSegmentStream:
 
 # --- item_matches --------------------------------------------------------------
 
+class TestSegmentStreamBoundedLookahead:
+    """The lookahead buffer has a ceiling.
+
+    Before this, peeking ahead to realign two drifted scans loaded pages forever and never
+    trimmed them: measured at 16x the segment's wire bytes per table in Python, growing
+    linearly with no ceiling, which is how a diff of two tables with disjoint keys ran a
+    G.1X task out of memory.
+    """
+
+    def _stream_of_pages(self, page_count, items_per_page=3, pk='id'):
+        """A stream with far more items than the lookahead is allowed to buffer."""
+        session = MagicMock()
+        client = MagicMock()
+        session.client.return_value = client
+        state = {'page': 0}
+
+        def mock_scan(**kwargs):
+            state['page'] += 1
+            items = [{pk: {'S': f"p{state['page']}-i{i}"}}
+                     for i in range(items_per_page)]
+            resp = {'Items': items}
+            if state['page'] < page_count:
+                resp['LastEvaluatedKey'] = {pk: {'S': 'marker'}}
+            return resp
+
+        client.scan.side_effect = mock_scan
+        stream = diff_module.SegmentStream(
+            session=session, table_name='wide-table', segment=7, total_segments=400,
+            consistent_read=False, pk=pk, sk=None)
+        return stream, client
+
+    def test_peeking_past_the_window_raises_rather_than_buffering(self):
+        # Page count derived from the cap, not hard-coded: at 3 items per page this serves
+        # 3x the window, so the bound is reached well before the segment is exhausted.
+        stream, _ = self._stream_of_pages(page_count=diff_module.MAX_LOOKAHEAD_ITEMS)
+
+        with pytest.raises(diff_module.BulkExecutorError) as raised:
+            # Ask for an item far enough ahead that reaching it would need the whole segment.
+            stream.peek(1_000_000)
+
+        message = str(raised.value)
+        assert 'too different to diff accurately' in message, \
+            'lead with the conclusion, not with our buffering'
+        assert 'segment 7' in message, 'name the segment, so a rerun can be reasoned about'
+        assert f'{diff_module.MAX_LOOKAHEAD_ITEMS:,} items' in message
+        assert len(message.splitlines()) == 1 and len(message) < 250, \
+            'one short sentence: it becomes the Glue failure reason and the closing line'
+
+    def test_the_buffer_never_exceeds_the_window_by_more_than_a_page(self):
+        stream, client = self._stream_of_pages(
+            page_count=diff_module.MAX_LOOKAHEAD_ITEMS, items_per_page=3)
+
+        with pytest.raises(diff_module.BulkExecutorError):
+            stream.peek(1_000_000)
+
+        assert len(stream.items) < diff_module.MAX_LOOKAHEAD_ITEMS + 3, \
+            'the cap is checked before a scan, so the last page is the only overshoot'
+        assert client.scan.call_count < diff_module.MAX_LOOKAHEAD_ITEMS, \
+            'it stopped asking for pages; it did not read the segment out'
+
+    def test_a_stream_read_in_step_is_unaffected(self):
+        """The bound is on *lookahead*. Reading a long stream one item at a time, which is
+        what an aligned diff does, drains the buffer before each load, so it never trips --
+        however many items the segment holds."""
+        pages = diff_module.MAX_LOOKAHEAD_ITEMS  # 3 items each, so 3x the window
+        stream, _ = self._stream_of_pages(page_count=pages, items_per_page=3)
+
+        seen = 0
+        while not stream.is_finished():
+            assert stream.head() is not None
+            stream.advance()
+            seen += 1
+
+        assert seen == pages * 3 > diff_module.MAX_LOOKAHEAD_ITEMS, \
+            'every item, well past the lookahead limit'
+
+    def test_consuming_frees_the_window_again(self):
+        """A small misalignment is peek-then-advance, repeatedly. len(self.items) falls as
+        items are consumed, so that shape never accumulates toward the cap."""
+        consumed = diff_module.MAX_LOOKAHEAD_ITEMS + 2_000  # past the cap, so it would trip
+        stream, _ = self._stream_of_pages(page_count=consumed, items_per_page=2)
+
+        for _ in range(consumed):
+            stream.peek(1)
+            stream.advance()
+
+        assert len(stream.items) < diff_module.MAX_LOOKAHEAD_ITEMS
+
+    def test_empty_pages_do_not_count_against_the_window(self):
+        """DynamoDB can return a page with no items and a LastEvaluatedKey, when the 1 MB read
+        window covered none of this segment's keys. A sparse segment must not read as drift."""
+        session = MagicMock()
+        client = MagicMock()
+        session.client.return_value = client
+        state = {'page': 0}
+
+        def mock_scan(**kwargs):
+            state['page'] += 1
+            if state['page'] < 500:
+                return {'Items': [], 'LastEvaluatedKey': {'id': {'S': 'marker'}}}
+            return {'Items': [{'id': {'S': 'found'}}]}
+
+        client.scan.side_effect = mock_scan
+        stream = diff_module.SegmentStream(
+            session=session, table_name='sparse', segment=0, total_segments=1,
+            consistent_read=False, pk='id', sk=None)
+
+        assert stream.head_pk() == 'found', 'walked 499 empty pages without tripping the cap'
+
+
 class TestItemMatches:
 
     def test_identical_items_match(self):
@@ -387,11 +509,11 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert result == []
 
@@ -436,11 +558,11 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert len(result) == 1
         assert result[0].startswith('-')
@@ -481,11 +603,11 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert len(result) == 1
         assert result[0].startswith('+')
@@ -531,11 +653,11 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert len(result) == 1
         assert result[0].startswith('*')
@@ -581,11 +703,11 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, False, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, False, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert len(result) == 2
         assert result[0].startswith('-')
@@ -637,12 +759,12 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
+            0, 1, False, True, 'job1', None,
             self._make_schema_broadcast(pk1='pk', sk1='sk', pk2='pk', sk2='sk'),
-            self._make_rate_limiter_config()
+            self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert any(r.startswith('-') for r in result)
 
@@ -692,12 +814,12 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
+            0, 1, False, True, 'job1', None,
             self._make_schema_broadcast(pk1='pk', sk1='sk', pk2='pk', sk2='sk'),
-            self._make_rate_limiter_config()
+            self._make_rate_limiter_config(), _FakeAccumulator()
         )
         plus_lines = [r for r in result if r.startswith('+')]
         assert len(plus_lines) == 1
@@ -706,7 +828,8 @@ class TestDiffSegment:
     @patch.object(diff_module, 'RateLimiterWorker')
     @patch.object(diff_module, 'SegmentStream')
     def test_s3_output_puts_object(self, mock_stream_cls, mock_rl, mock_boto3):
-        """When use_s3=True, diff is written to S3 and count returned."""
+        """The full diff is always written to S3 (under output/<job>/) and the
+        (count, preview) pair is returned."""
         mock_rl_instance = MagicMock()
         mock_rl_instance.get_session.return_value = MagicMock()
         mock_rl.return_value = mock_rl_instance
@@ -742,22 +865,24 @@ class TestDiffSegment:
         s3_client = MagicMock()
         mock_boto3.client.return_value = s3_client
 
-        result = diff_module.diff_segment(
+        count, preview = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            5, 10, False, True, 'job123', True, 'my-bucket',
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            5, 10, False, True, 'job123', 'my-bucket',
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
-        assert result == 1
+        assert count == 1
+        assert len(preview) == 1
         s3_client.put_object.assert_called_once()
         put_kwargs = s3_client.put_object.call_args.kwargs
         assert put_kwargs['Bucket'] == 'my-bucket'
-        assert put_kwargs['Key'] == 'job123/5.txt'
+        assert put_kwargs['Key'] == 'output/job123/5.txt'
 
     @patch.object(diff_module, 'RateLimiterWorker')
     @patch.object(diff_module, 'SegmentStream')
-    def test_output_truncated_to_print_limit(self, mock_stream_cls, mock_rl):
-        """Without S3, result is truncated to PRINT_LIMIT."""
+    def test_preview_capped_but_count_is_full(self, mock_stream_cls, mock_rl):
+        """The returned preview is capped at CONSOLE_PREVIEW_LIMIT while the count
+        reflects the full number of differences in the segment."""
         mock_rl_instance = MagicMock()
         mock_rl_instance.get_session.return_value = MagicMock()
         mock_rl.return_value = mock_rl_instance
@@ -789,13 +914,14 @@ class TestDiffSegment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        count, preview = diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
-        assert len(result) == diff_module.PRINT_LIMIT
+        assert count == num_items
+        assert len(preview) == diff_module.CONSOLE_PREVIEW_LIMIT
 
     @patch.object(diff_module, 'RateLimiterWorker')
     @patch.object(diff_module, 'SegmentStream')
@@ -821,28 +947,39 @@ class TestDiffSegment:
         diff_module.diff_segment(
             'table1', 'table2',
             self._make_monitor_options(), self._make_monitor_options(),
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), self._make_rate_limiter_config()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), _FakeAccumulator()
         )
         assert mock_rl_instance.shutdown.call_count == 2
 
     @patch.object(diff_module, 'RateLimiterWorker')
     @patch.object(diff_module, 'SegmentStream')
-    def test_rate_limiter_shutdown_on_exception(self, mock_stream_cls, mock_rl):
-        """Rate limiter workers are shut down even when an exception occurs."""
+    def test_worker_records_the_error_instead_of_escaping(self, mock_stream_cls, mock_rl):
+        """A failure is recorded on the accumulator, not raised out of the worker.
+
+        Letting it escape cost four Spark task retries, aborted the job, and reached
+        the driver as a Py4J wrapper -- 668 log lines whose closing line never named
+        the cause. copy and scancount already record-and-return; diff now matches
+        (issue #327). Rate limiter workers must still be shut down either way.
+        """
         mock_rl_instance = MagicMock()
         mock_rl_instance.get_session.return_value = MagicMock()
         mock_rl.return_value = mock_rl_instance
 
         mock_stream_cls.side_effect = RuntimeError("stream creation failed")
+        errors = _FakeAccumulator()
 
-        with pytest.raises(RuntimeError):
-            diff_module.diff_segment(
-                'table1', 'table2',
-                self._make_monitor_options(), self._make_monitor_options(),
-                0, 1, False, True, 'job1', False, None,
-                self._make_schema_broadcast(), self._make_rate_limiter_config()
-            )
+        count, preview = diff_module.diff_segment(
+            'table1', 'table2',
+            self._make_monitor_options(), self._make_monitor_options(),
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), self._make_rate_limiter_config(), errors
+        )
+
+        assert (count, preview) == (0, []), "an errored segment contributes nothing"
+        assert len(errors.value) == 1
+        message, _detail = errors.value[0]
+        assert 'Error in worker 0' in message, errors.value
         assert mock_rl_instance.shutdown.call_count == 2
 
 
@@ -884,7 +1021,6 @@ class TestRun:
             'table': 'table1',
             'table2': 'table2',
             'format': 'keys',
-            's3': None,
             'JOB_RUN_ID': 'job-1',
             's3-bucket-name': 'bucket',
         }
@@ -907,77 +1043,121 @@ class TestRun:
 
         return client_mock
 
+    def test_run_raises_the_first_worker_error(self, monkeypatch):
+        """The driver must surface what a worker recorded (issue #327).
+
+        Without this the run would print a diff summary as if nothing went wrong,
+        even though a segment had failed -- e.g. a table the role cannot Scan.
+        copy and scancount already report this way.
+        """
+        self._setup_run_mocks(monkeypatch)
+        args = self._base_args()
+
+        recorded = ['Error in worker 3: User: arn:aws:sts::1:assumed-role/r/s is not '
+                    'authorized to perform: dynamodb:Scan on resource: ...']
+        spark_context = MagicMock()
+        # A list-seeded accumulator is the error accumulator; hand back one that
+        # already holds what a failing worker would have recorded.
+        spark_context.accumulator = MagicMock(
+            side_effect=lambda init, *_: MagicMock(value=recorded if isinstance(init, list) else init))
+        rdd = MagicMock()
+        spark_context.parallelize.return_value = rdd
+        rdd.map.return_value.collect.return_value = [(0, [])]
+
+        with pytest.raises(Exception) as exc:
+            diff_module.run(MagicMock(), spark_context, MagicMock(), args)
+
+        assert 'Error in worker 3' in str(exc.value)
+        assert 'dynamodb:Scan' in str(exc.value)
+
     def test_no_diffs_prints_no_differences(self, monkeypatch, capsys):
         self._setup_run_mocks(monkeypatch)
         args = self._base_args()
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[], [], [], []]
+        # Each segment reports (count, preview).
+        rdd.map.return_value.collect.return_value = [(0, []), (0, []), (0, []), (0, [])]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
         out = capsys.readouterr().out
         assert 'No differences found' in out
+        # No S3 pointer when there's nothing written.
+        assert 'Wrote' not in out
 
-    def test_diffs_printed_up_to_limit(self, monkeypatch, capsys):
+    def test_small_diff_prints_all_and_pointer(self, monkeypatch, capsys):
         self._setup_run_mocks(monkeypatch)
         args = self._base_args()
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        diffs = [f'- item{i}' for i in range(50)]
-        rdd.map.return_value.collect.return_value = [diffs]
+        diffs = ['- a', '- b', '- c']
+        rdd.map.return_value.collect.return_value = [(3, diffs)]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
         out = capsys.readouterr().out
-        assert '50 differences' in out
+        assert '3 differences:' in out
+        for line in diffs:
+            assert line in out
+        assert '...and' not in out  # nothing truncated
+        assert 'Wrote 3 differences to s3://bucket/output/job-1/' in out
 
-    def test_diffs_over_limit_shows_truncation(self, monkeypatch, capsys):
+    def test_large_diff_prints_bounded_preview_and_pointer(self, monkeypatch, capsys):
         self._setup_run_mocks(monkeypatch)
         args = self._base_args()
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        diffs = [f'- item{i}' for i in range(150)]
-        rdd.map.return_value.collect.return_value = [diffs]
+        # One segment with 150 diffs; it already trims its own preview to the cap.
+        preview = [f'- item{i}' for i in range(diff_module.CONSOLE_PREVIEW_LIMIT)]
+        rdd.map.return_value.collect.return_value = [(150, preview)]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
         out = capsys.readouterr().out
-        assert 'output truncated' in out
-        assert '150 differences' in out
-        assert f'first {diff_module.PRINT_LIMIT}' in out
+        assert f'First {diff_module.CONSOLE_PREVIEW_LIMIT} of 150 differences:' in out
+        assert f'...and {150 - diff_module.CONSOLE_PREVIEW_LIMIT} more not printed' in out
+        assert 'Wrote 150 differences to s3://bucket/output/job-1/' in out
 
-    def test_s3_mode_prints_s3_path(self, monkeypatch, capsys):
+    def test_preview_assembled_across_segments_and_capped(self, monkeypatch, capsys):
+        """Counts sum across segments and the console preview is capped at
+        CONSOLE_PREVIEW_LIMIT even when assembled from several segments."""
         self._setup_run_mocks(monkeypatch)
         args = self._base_args()
-        args['s3'] = True
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [5, 3, 0, 2]
+        rdd.map.return_value.collect.return_value = [
+            (5, [f'- s0-{i}' for i in range(5)]),
+            (3, [f'- s1-{i}' for i in range(3)]),
+            (0, []),
+            (4, [f'- s3-{i}' for i in range(4)]),
+        ]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
         out = capsys.readouterr().out
-        assert '10 differences' in out
-        assert 's3://bucket/job-1/' in out
-
-    def test_s3_mode_no_diffs(self, monkeypatch, capsys):
-        self._setup_run_mocks(monkeypatch)
-        args = self._base_args()
-        args['s3'] = True
-
-        spark_context = MagicMock()
-        rdd = MagicMock()
-        spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [0, 0, 0, 0]
-
-        diff_module.run(MagicMock(), spark_context, MagicMock(), args)
-        out = capsys.readouterr().out
-        assert 'No differences found' in out
+        # 5 + 3 + 0 + 4 = 12 total
+        assert f'First {diff_module.CONSOLE_PREVIEW_LIMIT} of 12 differences:' in out
+        assert f'...and {12 - diff_module.CONSOLE_PREVIEW_LIMIT} more not printed' in out
+        # Exactly CONSOLE_PREVIEW_LIMIT preview lines printed (the "- " diff lines).
+        printed_diff_lines = [l for l in out.splitlines() if l.startswith('- s')]
+        assert len(printed_diff_lines) == diff_module.CONSOLE_PREVIEW_LIMIT
+        assert 'Wrote 12 differences to s3://bucket/output/job-1/' in out
 
     def test_sample_fraction_reduces_segments(self, monkeypatch, capsys):
         self._setup_run_mocks(monkeypatch)
@@ -986,9 +1166,12 @@ class TestRun:
         args['sample_fraction'] = '0.1'
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[] for _ in range(10)]
+        rdd.map.return_value.collect.return_value = [(0, []) for _ in range(10)]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
 
@@ -1004,6 +1187,9 @@ class TestRun:
         args = self._base_args()
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         spark_context.parallelize.side_effect = RuntimeError("spark error")
 
         with pytest.raises(Exception, match="Error in parallel execution"):
@@ -1014,6 +1200,9 @@ class TestRun:
         args = self._base_args()
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
         rdd.map.return_value.collect.side_effect = RuntimeError("worker error")
@@ -1029,9 +1218,12 @@ class TestRun:
         monkeypatch.setattr(diff_module, 'RateLimiterAggregator', MagicMock(return_value=agg))
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[]]
+        rdd.map.return_value.collect.return_value = [(0, [])]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
         agg.shutdown.assert_called_once()
@@ -1044,6 +1236,9 @@ class TestRun:
         monkeypatch.setattr(diff_module, 'RateLimiterAggregator', MagicMock(return_value=agg))
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
         rdd.map.return_value.collect.side_effect = RuntimeError("fail")
@@ -1066,9 +1261,12 @@ class TestRun:
         args = self._base_args()
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[]]
+        rdd.map.return_value.collect.return_value = [(0, [])]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
 
@@ -1093,9 +1291,12 @@ class TestRun:
 
         args = self._base_args()
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[]]
+        rdd.map.return_value.collect.return_value = [(0, [])]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
         out = capsys.readouterr().out
@@ -1107,9 +1308,12 @@ class TestRun:
         args['format'] = 'full'
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[]]
+        rdd.map.return_value.collect.return_value = [(0, [])]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
 
@@ -1119,9 +1323,12 @@ class TestRun:
         del args['splits']
 
         spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
         rdd = MagicMock()
         spark_context.parallelize.return_value = rdd
-        rdd.map.return_value.collect.return_value = [[] for _ in range(400)]
+        rdd.map.return_value.collect.return_value = [(0, []) for _ in range(400)]
 
         diff_module.run(MagicMock(), spark_context, MagicMock(), args)
 
@@ -1196,11 +1403,12 @@ class TestDiffSegmentAlignment:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2',
             {}, {},
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), MagicMock()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
         )
         minus_lines = [r for r in result if r.startswith('-')]
         plus_lines = [r for r in result if r.startswith('+')]
@@ -1211,6 +1419,196 @@ class TestDiffSegmentAlignment:
 
 
 # --- diff_segment: sort-key edge cases -----------------------------------------
+
+class TestDiffSegmentDisjointTables:
+    """Two tables that share no partition keys: the case that ran a task out of memory.
+
+    diff_segment cannot align them -- there is nothing to align on -- so it now reports
+    that in one sentence instead of loading both segments into Python. The failure goes on
+    the accumulator with no traceback, because there is nothing in our code to debug.
+    """
+
+    def _fake_session(self, prefix, item_count, items_per_page=25):
+        """A session whose scan pages through `item_count` items, keys prefixed."""
+        session = MagicMock()
+        client = MagicMock()
+        session.client.return_value = client
+        state = {'served': 0}
+
+        def mock_scan(**kwargs):
+            start = state['served']
+            end = min(start + items_per_page, item_count)
+            state['served'] = end
+            items = [{'pk': {'S': f'{prefix}-{i:06d}'}} for i in range(start, end)]
+            resp = {'Items': items}
+            if end < item_count:
+                resp['LastEvaluatedKey'] = {'pk': {'S': 'marker'}}
+            return resp
+
+        client.scan.side_effect = mock_scan
+        return session
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    def test_disjoint_keys_report_one_sentence_and_no_traceback(self, mock_rl):
+        """More items per stream than the lookahead may buffer, so there is no way to tell
+        whether the two ever meet without reading both segments out."""
+        over_the_cap = diff_module.MAX_LOOKAHEAD_ITEMS + 2_000
+        sessions = iter([self._fake_session('a', over_the_cap),
+                         self._fake_session('b', over_the_cap)])
+        worker = MagicMock()
+        worker.get_session.side_effect = lambda: next(sessions)
+        mock_rl.return_value = worker
+
+        broadcast = MagicMock()
+        broadcast.value = {'table1': {'pk': 'pk', 'sk': None},
+                           'table2': {'pk': 'pk', 'sk': None}}
+        accumulator = _FakeAccumulator()
+
+        count, preview = diff_module.diff_segment(
+            'table-a', 'table-b', {}, {}, 0, 400, False, True,
+            'jr_x', None, broadcast, MagicMock(), accumulator)
+
+        assert (count, preview) == (0, [])
+        assert len(accumulator.value) == 1
+        message, detail = accumulator.value[0]
+        assert 'too different to diff accurately' in message
+        assert detail is None, 'understood: a traceback would only show our own plumbing'
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    def test_disjoint_keys_inside_the_window_still_diff_completely(self, mock_rl):
+        """Under the cap there is no need to give up: reading both segments out proves the
+        two share nothing, and every item is a difference. That is the right answer, and the
+        cap is only reached by segments too big to hold."""
+        under_the_cap = 200
+        sessions = iter([self._fake_session('a', under_the_cap),
+                         self._fake_session('b', under_the_cap)])
+        worker = MagicMock()
+        worker.get_session.side_effect = lambda: next(sessions)
+        mock_rl.return_value = worker
+
+        broadcast = MagicMock()
+        broadcast.value = {'table1': {'pk': 'pk', 'sk': None},
+                           'table2': {'pk': 'pk', 'sk': None}}
+        accumulator = _FakeAccumulator()
+
+        count, preview = diff_module.diff_segment(
+            'table-a', 'table-b', {}, {}, 0, 400, False, True,
+            'jr_x', None, broadcast, MagicMock(), accumulator)
+
+        assert accumulator.value == [], 'nothing failed'
+        assert count == 2 * under_the_cap, 'every item on both sides, and nothing invented'
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    def test_a_small_misalignment_still_aligns(self, mock_rl):
+        """The bound must not break the case it exists to serve: tables that drift a
+        little and then meet again."""
+        a_items = [{'pk': {'S': f'k-{i:04d}'}} for i in range(60)]
+        b_items = [{'pk': {'S': f'k-{i:04d}'}} for i in range(60) if i not in (3, 4, 5)]
+
+        def session_of(items):
+            session, client = MagicMock(), MagicMock()
+            session.client.return_value = client
+            client.scan.side_effect = [{'Items': items}]
+            return session
+
+        sessions = iter([session_of(a_items), session_of(b_items)])
+        worker = MagicMock()
+        worker.get_session.side_effect = lambda: next(sessions)
+        mock_rl.return_value = worker
+
+        broadcast = MagicMock()
+        broadcast.value = {'table1': {'pk': 'pk', 'sk': None},
+                           'table2': {'pk': 'pk', 'sk': None}}
+        accumulator = _FakeAccumulator()
+
+        count, preview = diff_module.diff_segment(
+            'table-a', 'table-b', {}, {}, 0, 400, False, True,
+            'jr_x', None, broadcast, MagicMock(), accumulator)
+
+        assert accumulator.value == [], 'nothing failed'
+        assert count == 3, 'the three keys missing from B, and nothing invented'
+        assert all('k-000' in line for line in preview)
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    def test_wide_unmatched_item_collection_still_diffs(self, mock_rl):
+        """An item collection one table lacks must not end the run (#356).
+
+        Every item in a collection carries the same pk, so peeking through it adds
+        nothing to the seen-pk set -- realigning means buffering the whole collection
+        to learn one fact. At the old 10,000 this failed with 'too different to diff
+        accurately' on tables identical apart from the collection, which is the
+        opposite of the disjoint case the bound exists for.
+        """
+        collection = 12_000
+        lead = [{'pk': {'S': f'k-{i:06d}'}, 'sk': {'S': 's-0'}} for i in range(10)]
+        trail = [{'pk': {'S': f'z-{i:06d}'}, 'sk': {'S': 's-0'}} for i in range(10)]
+        extra = [{'pk': {'S': 'P'}, 'sk': {'S': f's-{i:06d}'}} for i in range(collection)]
+
+        def session_of(items, per_page=500):
+            session, client = MagicMock(), MagicMock()
+            session.client.return_value = client
+            state = {'served': 0}
+
+            def mock_scan(**kwargs):
+                start = state['served']
+                end = min(start + per_page, len(items))
+                state['served'] = end
+                resp = {'Items': items[start:end]}
+                if end < len(items):
+                    resp['LastEvaluatedKey'] = {'pk': {'S': 'marker'}}
+                return resp
+
+            client.scan.side_effect = mock_scan
+            return session
+
+        sessions = iter([session_of(lead + extra + trail), session_of(lead + trail)])
+        worker = MagicMock()
+        worker.get_session.side_effect = lambda: next(sessions)
+        mock_rl.return_value = worker
+
+        broadcast = MagicMock()
+        broadcast.value = {'table1': {'pk': 'pk', 'sk': 'sk'},
+                           'table2': {'pk': 'pk', 'sk': 'sk'}}
+        accumulator = _FakeAccumulator()
+
+        count, preview = diff_module.diff_segment(
+            'table-a', 'table-b', {}, {}, 0, 400, False, True,
+            'jr_x', None, broadcast, MagicMock(), accumulator)
+
+        assert accumulator.value == [], 'a collection A alone has is a difference, not a failure'
+        assert count == collection, \
+            'every item of the unmatched collection, and nothing invented'
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    def test_alignment_found_from_the_second_stream(self, mock_rl):
+        """The realignment check runs on whichever stream just produced a key, so a match
+        discovered while peeking into B counts as much as one found in A."""
+        a_items = [{'pk': {'S': p}} for p in ('x1', 'x2', 'shared')]
+        b_items = [{'pk': {'S': p}} for p in ('y1', 'y2', 'y3', 'y4', 'shared')]
+
+        def session_of(items):
+            session, client = MagicMock(), MagicMock()
+            session.client.return_value = client
+            client.scan.side_effect = [{'Items': items}]
+            return session
+
+        sessions = iter([session_of(a_items), session_of(b_items)])
+        worker = MagicMock()
+        worker.get_session.side_effect = lambda: next(sessions)
+        mock_rl.return_value = worker
+
+        broadcast = MagicMock()
+        broadcast.value = {'table1': {'pk': 'pk', 'sk': None},
+                           'table2': {'pk': 'pk', 'sk': None}}
+        accumulator = _FakeAccumulator()
+
+        count, preview = diff_module.diff_segment(
+            'table-a', 'table-b', {}, {}, 0, 400, False, True,
+            'jr_x', None, broadcast, MagicMock(), accumulator)
+
+        assert accumulator.value == []
+        assert count == 6, 'x1 x2 missing from B, y1..y4 missing from A; shared matches'
+
 
 class TestDiffSegmentSortKeyEdges:
     """Cover remaining branches in the sort-key comparison logic."""
@@ -1264,10 +1662,11 @@ class TestDiffSegmentSortKeyEdges:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2', {}, {},
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), MagicMock()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
         )
         assert len(result) == 1
         assert result[0].startswith('*')
@@ -1313,10 +1712,11 @@ class TestDiffSegmentSortKeyEdges:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2', {}, {},
-            0, 1, False, False, 'job1', False, None,
-            self._make_schema_broadcast(), MagicMock()
+            0, 1, False, False, 'job1', None,
+            self._make_schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
         )
         assert len(result) == 2
         assert result[0].startswith('-')
@@ -1368,10 +1768,11 @@ class TestDiffSegmentSortKeyEdges:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2', {}, {},
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), MagicMock()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
         )
         minus_lines = [r for r in result if r.startswith('-')]
         plus_lines = [r for r in result if r.startswith('+')]
@@ -1423,10 +1824,11 @@ class TestDiffSegmentSortKeyEdges:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2', {}, {},
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), MagicMock()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
         )
         plus_lines = [r for r in result if r.startswith('+')]
         assert len(plus_lines) == 2
@@ -1476,10 +1878,11 @@ class TestDiffSegmentSortKeyEdges:
 
         mock_stream_cls.side_effect = [stream_a, stream_b]
 
-        result = diff_module.diff_segment(
+        _, result = diff_module.diff_segment(
             'table1', 'table2', {}, {},
-            0, 1, False, True, 'job1', False, None,
-            self._make_schema_broadcast(), MagicMock()
+            0, 1, False, True, 'job1', None,
+            self._make_schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
         )
         minus_lines = [r for r in result if r.startswith('-')]
         assert len(minus_lines) == 2
@@ -1559,3 +1962,227 @@ class TestAttributeTypeCoverage:
         a = {'pk': {'S': 'k'}, 'attr': {'BOOL': True}}
         b = {'pk': {'S': 'k'}, 'attr': {'BOOL': False}}
         assert not diff_module.item_matches(a, b)
+
+
+# --- Cross-Region Support (supersedes PR #243) ------------------------------
+
+# diff.py imports `_region_from_table_ref` / `_default_region` from table_info,
+# but tests/server/conftest.py registers that module as a bare Mock(), so the
+# names diff imported are Mocks (a Mock returns a truthy Mock for any input and
+# would never parse an ARN). Load the *real* table_info from disk so we can use
+# the genuine ARN parser. It's registered under its real package name so the
+# relative imports (.logger, .pricing, .bulk_executor_error) resolve to the
+# conftest-provided modules; we restore the Mock afterward so other tests that
+# rely on table_info being a Mock are unaffected.
+import importlib.util as _importlib_util
+from pathlib import Path as _Path
+
+_TABLE_INFO_PATH = (
+    _Path(__file__).resolve().parents[2]
+    / "server/src/python_modules/shared/table_info.py"
+)
+_prev_table_info = sys.modules.get('python_modules.shared.table_info')
+_ti_spec = _importlib_util.spec_from_file_location(
+    "python_modules.shared.table_info", str(_TABLE_INFO_PATH)
+)
+_real_table_info = _importlib_util.module_from_spec(_ti_spec)
+sys.modules['python_modules.shared.table_info'] = _real_table_info
+_ti_spec.loader.exec_module(_real_table_info)
+if _prev_table_info is not None:
+    sys.modules['python_modules.shared.table_info'] = _prev_table_info
+
+_real_region_from_table_ref = _real_table_info._region_from_table_ref
+
+
+class TestCrossRegionDiff:
+    """Cross-region / cross-account diff: an ARN table ref drives its own
+    region on the DynamoDB client, while the rate limiter (S3 coordination)
+    stays in the bootstrap region."""
+
+    def _empty_stream(self):
+        stream = MagicMock()
+        stream.is_finished.return_value = True
+        stream.head.return_value = None
+        stream.has_sort_key = False
+        stream.pk = 'pk'
+        return stream
+
+    def _schema_broadcast(self):
+        b = MagicMock()
+        b.value = {'table1': {'pk': 'pk', 'sk': None}, 'table2': {'pk': 'pk', 'sk': None}}
+        return b
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    @patch.object(diff_module, 'SegmentStream')
+    def test_two_arns_pass_each_region_to_segmentstream(self, mock_stream_cls, mock_rl, monkeypatch):
+        """Two ARNs from different regions -> each SegmentStream gets its ARN's
+        region; RateLimiterWorker never gets region_name (S3 stays put)."""
+        monkeypatch.setattr(diff_module, '_region_from_table_ref', _real_region_from_table_ref)
+        mock_rl.return_value.get_session.return_value = MagicMock()
+        mock_stream_cls.return_value = self._empty_stream()
+
+        arn1 = 'arn:aws:dynamodb:us-east-1:123456789012:table/t1'
+        arn2 = 'arn:aws:dynamodb:eu-west-1:123456789012:table/t2'
+        diff_module.diff_segment(
+            arn1, arn2, {}, {}, 0, 1, False, True, 'job1', None,
+            self._schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
+        )
+
+        for c in mock_rl.call_args_list:
+            assert 'region_name' not in c.kwargs
+        calls = mock_stream_cls.call_args_list
+        assert calls[0].kwargs['region_name'] == 'us-east-1'
+        assert calls[1].kwargs['region_name'] == 'eu-west-1'
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    @patch.object(diff_module, 'SegmentStream')
+    def test_two_plain_names_use_session_default_region(self, mock_stream_cls, mock_rl, monkeypatch):
+        """Two plain table names -> both SegmentStreams get the session's region."""
+        monkeypatch.setattr(diff_module, '_region_from_table_ref', _real_region_from_table_ref)
+        session = MagicMock()
+        session.region_name = 'us-west-2'
+        mock_rl.return_value.get_session.return_value = session
+        mock_stream_cls.return_value = self._empty_stream()
+
+        diff_module.diff_segment(
+            'table1', 'table2', {}, {}, 0, 1, False, True, 'job1', None,
+            self._schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
+        )
+
+        for c in mock_rl.call_args_list:
+            assert 'region_name' not in c.kwargs
+        calls = mock_stream_cls.call_args_list
+        assert calls[0].kwargs['region_name'] == 'us-west-2'
+        assert calls[1].kwargs['region_name'] == 'us-west-2'
+
+    @patch.object(diff_module, 'RateLimiterWorker')
+    @patch.object(diff_module, 'SegmentStream')
+    def test_mixed_arn_and_plain_name(self, mock_stream_cls, mock_rl, monkeypatch):
+        """One ARN + one plain name -> ARN region for the first, session default
+        for the second."""
+        monkeypatch.setattr(diff_module, '_region_from_table_ref', _real_region_from_table_ref)
+        session = MagicMock()
+        session.region_name = 'us-east-1'
+        mock_rl.return_value.get_session.return_value = session
+        mock_stream_cls.return_value = self._empty_stream()
+
+        arn1 = 'arn:aws:dynamodb:ap-southeast-1:123456789012:table/t1'
+        diff_module.diff_segment(
+            arn1, 'plain-table', {}, {}, 0, 1, False, True, 'job1', None,
+            self._schema_broadcast(), MagicMock(),
+            _FakeAccumulator(),
+        )
+
+        calls = mock_stream_cls.call_args_list
+        assert calls[0].kwargs['region_name'] == 'ap-southeast-1'
+        assert calls[1].kwargs['region_name'] == 'us-east-1'
+
+    def test_print_table_info_uses_arn_region(self, monkeypatch):
+        """print_dynamodb_table_info passes the ARN's region to scan-cost."""
+        monkeypatch.setattr(diff_module, '_region_from_table_ref', _real_region_from_table_ref)
+        monkeypatch.setattr(diff_module, '_default_region', lambda: 'us-east-1')
+        monkeypatch.setattr(diff_module, 'get_and_print_dynamodb_table_info', MagicMock(return_value={'item_count': 100}))
+        scan_cost = MagicMock(return_value=1.0)
+        monkeypatch.setattr(diff_module, 'get_and_print_table_scan_cost', scan_cost)
+
+        diff_module.print_dynamodb_table_info('arn:aws:dynamodb:ap-northeast-1:123456789012:table/my-table')
+
+        assert scan_cost.call_args[0][1] == 'ap-northeast-1'
+
+    def test_print_table_info_plain_name_uses_default(self, monkeypatch):
+        """A plain table name uses the default region for scan-cost."""
+        monkeypatch.setattr(diff_module, '_region_from_table_ref', _real_region_from_table_ref)
+        monkeypatch.setattr(diff_module, '_default_region', lambda: 'eu-central-1')
+        monkeypatch.setattr(diff_module, 'get_and_print_dynamodb_table_info', MagicMock(return_value={'item_count': 100}))
+        scan_cost = MagicMock(return_value=0.5)
+        monkeypatch.setattr(diff_module, 'get_and_print_table_scan_cost', scan_cost)
+
+        diff_module.print_dynamodb_table_info('my-table')
+
+        assert scan_cost.call_args[0][1] == 'eu-central-1'
+
+    def _run_args(self):
+        return {
+            'splits': '2',
+            'sample_fraction': '1.0',
+            'table': 'arn:aws:dynamodb:us-east-1:111111111111:table/t1',
+            'table2': 'arn:aws:dynamodb:eu-west-1:222222222222:table/t2',
+            'format': 'keys',
+            'JOB_RUN_ID': 'job-1',
+            's3-bucket-name': 'bucket',
+        }
+
+    def _wire_run(self, monkeypatch):
+        monkeypatch.setattr(diff_module, '_region_from_table_ref', _real_region_from_table_ref)
+        monkeypatch.setattr(diff_module, '_default_region', lambda: 'us-east-1')
+        monkeypatch.setattr(diff_module, 'print_dynamodb_table_info', MagicMock(return_value=0.10))
+        client_mock = MagicMock()
+        client_mock.describe_table.return_value = {
+            'Table': {'KeySchema': [{'AttributeName': 'pk', 'KeyType': 'HASH'}]}
+        }
+        boto3_mock = MagicMock()
+        boto3_mock.client.return_value = client_mock
+        monkeypatch.setattr(diff_module, 'boto3', boto3_mock)
+        monkeypatch.setattr(diff_module, 'RateLimiterSharedConfig', MagicMock())
+        agg_cls = MagicMock()
+        monkeypatch.setattr(diff_module, 'RateLimiterAggregator', agg_cls)
+        monkeypatch.setattr(diff_module, 'get_dynamodb_throughput_configs', MagicMock(return_value={}))
+        spark_context = MagicMock()
+        # accumulator() must yield .value == the seed, like test_copy does,
+        # or run()'s `if error_accumulator.value` sees a truthy MagicMock.
+        spark_context.accumulator = MagicMock(side_effect=lambda init, *_: MagicMock(value=init))
+        rdd = MagicMock()
+        spark_context.parallelize.return_value = rdd
+        rdd.map.return_value.collect.return_value = [(0, [])]
+        return boto3_mock, agg_cls, spark_context
+
+    def test_run_describe_clients_use_per_table_region(self, monkeypatch):
+        """run() creates the describe_table clients in each table's ARN region."""
+        boto3_mock, _, spark_context = self._wire_run(monkeypatch)
+
+        diff_module.run(MagicMock(), spark_context, MagicMock(), self._run_args())
+
+        dynamodb_calls = [c for c in boto3_mock.client.call_args_list if c[0][0] == 'dynamodb']
+        regions = [c.kwargs['region_name'] for c in dynamodb_calls]
+        assert 'us-east-1' in regions
+        assert 'eu-west-1' in regions
+
+    def test_run_aggregator_not_regionalized(self, monkeypatch):
+        """The RateLimiterAggregator (S3 coordination) never receives region_name."""
+        _, agg_cls, spark_context = self._wire_run(monkeypatch)
+
+        diff_module.run(MagicMock(), spark_context, MagicMock(), self._run_args())
+
+        agg_cls.assert_called_once()
+        assert 'region_name' not in agg_cls.call_args.kwargs
+
+
+class TestDriverRaisesBulkExecutorError:
+    """The driver must raise BulkExecutorError, not a plain Exception.
+
+    root.py catches BulkExecutorError and calls sys.exit(str(e)), which Glue records
+    as the job's ErrorMessage and the client prints as its closing line. A plain
+    Exception is re-raised instead, so the user gets a Python traceback and a
+    GlueExceptionAnalysis blob on top of the message: measured at 82 lines with a
+    traceback, against 52 lines and none once this raised BulkExecutorError.
+    """
+
+    def test_diff_run_raises_bulk_executor_error(self, monkeypatch):
+        from python_modules.shared.bulk_executor_error import BulkExecutorError
+        run_mocks = TestRun()
+        run_mocks._setup_run_mocks(monkeypatch)
+        args = TestRun()._base_args()
+
+        recorded = ['Error in worker 0: not authorized to perform: dynamodb:Scan']
+        spark_context = MagicMock()
+        spark_context.accumulator = MagicMock(
+            side_effect=lambda init, *_: MagicMock(value=recorded if isinstance(init, list) else init))
+        rdd = MagicMock()
+        spark_context.parallelize.return_value = rdd
+        rdd.map.return_value.collect.return_value = [(0, [])]
+
+        with pytest.raises(BulkExecutorError) as exc:
+            diff_module.run(MagicMock(), spark_context, MagicMock(), args)
+        assert 'dynamodb:Scan' in str(exc.value)

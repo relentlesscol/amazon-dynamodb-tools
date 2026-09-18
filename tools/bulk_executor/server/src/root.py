@@ -1,11 +1,13 @@
 import importlib
 import sys
 import traceback
+import warnings
 
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.transforms import *
 from pyspark.context import SparkContext
+from python_modules.shared import driver_errors
 from python_modules.shared.bulk_executor_error import BulkExecutorError
 
 
@@ -56,6 +58,15 @@ spark_context = SparkContext.getOrCreate()
 glue_context = GlueContext(spark_context)
 job = Job(glue_context)
 
+# awsglue's own DynamicFrame.toDF() calls pyspark's internal DataFrame
+# constructor, which emits a UserWarning users can't act on. Suppress it once
+# here, after the contexts are built (so nothing in Spark/Glue startup resets
+# the filter) and before any verb is imported, so every verb inherits it
+# instead of each one re-declaring the same filter. Pinned to this exact
+# message on purpose — a blanket UserWarning ignore would hide real warnings.
+warnings.filterwarnings(
+    "ignore", message="DataFrame constructor is internal. Do not directly use it.")
+
 # Import the module
 module_path = 'python_modules'
 
@@ -71,6 +82,16 @@ action_script_function_name = 'run'
 from python_modules.shared.logger import init, log # Import order intentional to determine if XDebug flag present (for debug logging)
 init(parsed_args)
 
+# Pace stdout so CloudWatch Live Tail can actually deliver what we print. Live Tail
+# silently drops events that arrive faster than it will deliver them -- 79% of rows
+# lost on a measured run, with its own `sampled` flag reporting false -- so printing
+# a large result in one burst can truncate or corrupt it while the job still reports
+# success (issues #315, #321). Installed here, once, so every verb inherits it
+# rather than each one pacing its own prints. stdout only: logging goes to stderr and
+# diagnostics should not queue behind a big result set.
+from python_modules.shared.throttled_output import install as _install_output_throttle
+_install_output_throttle()
+
 try:
     module = importlib.import_module(module_name)
 except ImportError:
@@ -83,11 +104,21 @@ else:
         action_script_function = getattr(module, action_script_function_name)
         try:
             action_script_function(job, spark_context, glue_context, parsed_args)  # Run the function
-        except BulkExecutorError as e:
-            log.error(f"BulkExecutorError: {e}")
-            sys.exit(str(e))
-        except Exception as e:
-            raise # Just let it propagate
+        except BaseException as e:
+            # Everything a verb can fail with lands here, and shared/driver_errors.py
+            # decides what the user sees: a denial or other understood failure exits with
+            # one sentence, anything else prints its traceback first and then exits with a
+            # one-line reason. Exiting rather than re-raising is the point -- a re-raise
+            # hands the user Glue's exception-analysis blob plus Py4J's restatement of the
+            # same error, with AWS's actual sentence buried inside a Java stack (#332).
+            #
+            # BaseException rather than Exception so nothing escapes by inheriting from
+            # the wrong base -- but SystemExit passes straight through: a helper that
+            # already called exit() has said its piece, and re-reporting it would relabel
+            # a deliberate exit as a surprise.
+            if isinstance(e, SystemExit):
+                raise
+            driver_errors.surface(e)
     else:
         raise Exception(f"Could not find the function '{action_script_function_name}' within the module '{module_name}'.")
 

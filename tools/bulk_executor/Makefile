@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install test test-client test-server coverage clean test-e2e test-e2e-connector test-e2e-cleanup test-e2e-security test-e2e-security-simulator test-e2e-security-real test-e2e-commands test-e2e-whole-system test-e2e-max-rate
+.PHONY: help install test test-client test-server coverage clean test-e2e test-e2e-connector test-e2e-cleanup test-e2e-security test-e2e-security-simulator test-e2e-security-real test-e2e-security-validator test-e2e-commands test-e2e-whole-system test-e2e-max-rate test-e2e-capacity-warnings
 
 VENV := .venv
 PIP := $(VENV)/bin/pip
@@ -24,9 +24,11 @@ help:
 	@echo "  make test-e2e-security              Security: simulator + real-bootstrap (~3 min, ~\$$0)"
 	@echo "  make test-e2e-security-simulator    Security tier 1 only: iam:SimulateCustomPolicy"
 	@echo "  make test-e2e-security-real         Security tier 2 only: real temp IAM user + bootstrap"
+	@echo "  make test-e2e-security-validator    Custom-role validator vs real IAM (throwaway roles, safe)"
 	@echo "  make test-e2e-commands              Bulk-command smokes against transient tables"
 	@echo "  make test-e2e-whole-system          True e2e: 60k load round-trip + observed rate enforcement"
 	@echo "  make test-e2e-max-rate              EXPENSIVE: prove load beats the old 60k connector ceiling (~\$$ per run)"
+	@echo "  make test-e2e-capacity-warnings     #89 rate-vs-capacity warnings, proven live (~5 short jobs)"
 	@echo "  make test-e2e-cleanup               Delete orphaned items left by a crashed e2e run"
 
 install:
@@ -92,6 +94,14 @@ test-e2e-security-real:
 	  --override-ini="testpaths=tests/e2e" \
 	  --e2e-suite="security real-bootstrap"
 
+# Custom-role validator against real IAM. IAM-only (create/read/delete
+# throwaway AWSGlueServiceRole-* roles), parallel-safe, touches no shared
+# Glue job -- so it's safe to run anytime, unlike the destructive real tier.
+test-e2e-security-validator:
+	$(PYTEST) tests/e2e/security/test_custom_role_validation_live.py -s -v --tb=short --no-cov \
+	  --override-ini="testpaths=tests/e2e" \
+	  --e2e-suite="security custom-role validator"
+
 # Commands suite: exercises bulk commands (fill/update/delete/copy/diff)
 # against transient tables created+torn-down per test. No pre-existing
 # tables required.
@@ -114,6 +124,19 @@ test-e2e-max-rate:
 	  --override-ini="testpaths=tests/e2e" \
 	  -m "max_rate" \
 	  --e2e-suite="max-rate (beats legacy 60k ceiling)"
+
+# Issue #89 capacity/rate warnings, proven LIVE. Runs the four transient-table
+# scenarios (whole_system) and the missing-permission degradation (security)
+# serially in one process. Serial is required: the missing-perm test flips the
+# shared job's role and restores it in a finally, so it must not overlap the
+# write-capable scenarios. Each warning fires at throughput-config setup, so
+# fixtures are tiny — cost is ~5 short Glue jobs, not a max-rate run.
+test-e2e-capacity-warnings:
+	$(PYTEST) tests/e2e/whole_system/test_capacity_warnings.py \
+	  tests/e2e/security/test_capacity_warning_missing_perm.py \
+	  -s -v --tb=short --no-cov \
+	  --override-ini="testpaths=tests/e2e" \
+	  --e2e-suite="capacity warnings (#89, live)"
 
 test-e2e-cleanup:
 	$(VENV)/bin/python -m tests.e2e.helpers.cleanup

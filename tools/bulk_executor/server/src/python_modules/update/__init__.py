@@ -13,13 +13,19 @@ from pyspark.context import SparkContext
 
 # Custom Library Imports
 sys.path.append('/server/src')
+from python_modules.shared.bulk_executor_error import BulkExecutorError
 from python_modules.shared.errors import *
+from python_modules.shared.failure_reporter import BoundedFailureReporter
 from python_modules.shared.logger import log
 from python_modules.shared.pricing import PricingUtility
 from python_modules.shared.rate_limiter import (
     RateLimiterAggregator,
     RateLimiterSharedConfig,
     RateLimiterWorker
+)
+from python_modules.shared.worker_errors import (
+    raise_first_worker_error,
+    record_worker_failure
 )
 from python_modules.shared.table_info import (
     get_and_print_dynamodb_table_info, get_and_print_table_scan_cost,
@@ -84,9 +90,7 @@ def run(job, spark_context, glue_context, parsed_args):
         raise Exception(f"Error in parallel execution: {get_error_message(e)}") from None
     finally:
         rate_limiter_aggregator.shutdown()
-    if error_accumulator.value:
-        first_error = error_accumulator.value[0]
-        raise Exception(first_error) from None
+    raise_first_worker_error(error_accumulator)
 
     # Print the total records inserted using the accumulator after all tasks complete
     #print(f"Total records scanned and possibly updated: {updated_accumulator.value:,}")
@@ -114,8 +118,10 @@ def _update_data(monitor_options, table_name, generate, segment, total_segments,
     updated_count = 0
     skipped_count = 0
     failed_count = 0
+    # Counting is already done by failed_count/failed_accumulator, so this only bounds
+    # the logging. See shared/failure_reporter.py.
+    condition_failures = BoundedFailureReporter('Update condition')
     scan_kwargs = {
-        "TableName": table_name,
         "Segment": segment,
         "TotalSegments": total_segments
     }
@@ -135,11 +141,19 @@ def _update_data(monitor_options, table_name, generate, segment, total_segments,
                 except botocore.exceptions.ClientError as e:
                     error_code = get_error_code(e)
                     if error_code == DYNAMO_DB_THROTTLE_EXCEPTION:
-                        exit("Throttling observed despite massive retries")
+                        # BulkExecutorError, not exit(): SystemExit is a BaseException,
+                        # so it would slip past the worker's except below and cost four
+                        # Spark retries before aborting the job.
+                        raise BulkExecutorError("Throttling observed despite massive retries") from None
                     elif error_code == DYNAMO_DB_VALIDATION_EXCEPTION:
-                        exit(f"Validation exception (usually caused by the generator producing items incompatible with the table schema): {get_error_message(e)}")
+                        raise BulkExecutorError(f"Validation exception (usually caused by the generator producing items incompatible with the table schema): {get_error_message(e)}") from None
                     elif error_code == DYNAMO_DB_CONDITIONAL_CHECK_FAILED:
-                        print(f"UpdateItem condition expression failed, skipping... with kwargs: {update_kwargs}")
+                        # A condition that does not match is a normal outcome of what the
+                        # user asked for, and the driver already prints the total below as
+                        # "N conditions failed". So log the key only, and only the first
+                        # few per worker: there are 800 workers, this fires once per item,
+                        # and nothing printed here is ever shown to the user anyway.
+                        condition_failures.report(update_kwargs.get('Key'), 'condition not met')
                         failed_count += 1
                     else:
                         print('Unhandled ClientError thrown!', e, file=sys.stderr)
@@ -150,7 +164,7 @@ def _update_data(monitor_options, table_name, generate, segment, total_segments,
             scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
     except Exception as e:
-        error_accumulator.add([f"Error in worker {segment}: {get_error_message(e)}"])
+        record_worker_failure(error_accumulator, e, f"Error in worker {segment}")
         # Let control drop down to exit
     finally:
         rate_limiter_worker.shutdown()

@@ -1,8 +1,8 @@
 # Bulk Executor for Amazon DynamoDB
 
-![tests](https://img.shields.io/badge/tests-1330%20passing-brightgreen)
-![line coverage](https://img.shields.io/badge/line%20coverage-94.1%25-brightgreen)
-![branch coverage](https://img.shields.io/badge/branch%20coverage-91.7%25-brightgreen)
+![tests](https://img.shields.io/badge/tests-1558%20passing-brightgreen)
+![line coverage](https://img.shields.io/badge/line%20coverage-95.2%25-brightgreen)
+![branch coverage](https://img.shields.io/badge/branch%20coverage-91.9%25-brightgreen)
 
 Bulk Executor for Amazon DynamoDB lets you efficiently run bulk commands against even large tables. It:
 
@@ -77,14 +77,36 @@ Here are some example use cases:
 # Use single quotes around the JSON and double quotes within!
 ./bulk scancount --table t --index i --filter-expression "a = :aval" --expression-values '{":aval":"foo"}'
 
+# Add --per-segment to print each segment's item count (sorted, with a
+# skew ratio and a warning when the hottest segment exceeds 5x the mean).
+# Useful for diagnosing hot partitions / uneven key distribution.
+./bulk scancount --table t --per-segment
+
+# By default scancount uses 200 parallel scan segments. Use --segments to
+# tune that: fewer for small tables, more to increase per-segment resolution.
+./bulk scancount --table t --per-segment --segments 50
+
+# Use --sample-fraction to scan only a fraction of the segments and 
+# extrapolate an estimated total with a 95% confidence interval. Most
+# useful when paired with a --filter-expression to, for example, estimate
+# how many items have an ISO timestamp from 2024 or earlier.
+# Combine with --per-segment to see the skew that drives the error margin.
+# This command divides the table into 10,000 segments, samples 1% (100) of them,
+# limits the count to older items, and prints the counts per segment and the
+# likely extrapolated overall count based on the statistical sampling.
+./bulk scancount --table t --segments 10000 --sample-fraction 0.01 --per-segment --filter-expression "#ts < :cutoff" --expression-names '{"#ts": "timestamp"}' --expression-values '{":cutoff":"2025-01-01"}'
+
 
 # Compare two tables for differences (uses segmented scans internally)
+# You can specify a name or a full ARN. Using an ARN lets you diff cross-region and cross-account!
+# If going cross-account, you need a resource-based policy on the table to allow access.
 ./bulk diff --table t --table2 t2
+./bulk diff --table arn:aws:dynamodb:us-east-1:123456789012:table/t --table2 arn:aws:dynamodb:us-west-2:987654321098:table/t2
 
 # The default diff format is "keys" to show primary keys having changes with +/-/* for adds/removes/changes
 # Specifying the format "full" outputs the total items with +/- for before/after
-# Output can be directed to to S3
-./bulk diff --table t --table2 t2 --format full --s3
+# The full diff is always written to S3; the first few differences are printed to the console
+./bulk diff --table t --table2 t2 --format full
 
 # For speed and cost reasons, you can diff a sample of both tables, here 10%
 ./bulk diff --table t --table2 t2 --sample-fraction 0.1
@@ -217,6 +239,7 @@ The bootstrap must be performed by a role with this policy at minimum:
                 "iam:GetRole",
                 "iam:CreateRole",
                 "iam:DeleteRole",
+                "iam:UpdateAssumeRolePolicy",
                 "iam:AttachRolePolicy",
                 "iam:DetachRolePolicy",
                 "iam:ListAttachedRolePolicies",
@@ -287,9 +310,11 @@ The bootstrap must be performed by a role with this policy at minimum:
             "Effect": "Allow",
             "Action": [
                 "logs:CreateLogGroup",
-                "logs:PutRetentionPolicy"
+                "logs:PutRetentionPolicy",
+                "logs:DescribeLogGroups"
             ],
             "Resource": [
+                "arn:aws:logs:*:*:log-group::log-stream:",
                 "arn:aws:logs:*:*:log-group:/aws-glue/jobs/*"
             ]
         }        
@@ -320,14 +345,22 @@ You can also exercise exact control of what permissions and policies the Glue ro
 ./bulk bootstrap --XRole rolename
 ```
 
+#### Glue job role permissions
+
+Each Glue job has a service role assigned to the job that's used during execution. `bootstrap --XRole READ-ONLY` / `READ-WRITE` create it for you; you only need this section if you supply your own role with `--XRole <rolename>`, or if you want to audit what's held by the created role.
+
 If you provide a custom IAM role for your AWS Glue job:
 
 * Ensure the role name starts with `AWSGlueServiceRole`
 * Ensure the role has a trust policy that allows the Glue service principal (`glue.amazonaws.com`) to assume the role.
 * Attach the managed policy `AWSGlueServiceRole` to grant Glue its baseline execution permissions.
-* Attach `ServiceQuotasReadOnlyAccess` to allow the job to read service quota information (used to detect account-level read/write limits), or for maximum lockdown allow the `pricing:GetProducts` action.
-* Attach `AWSPriceListServiceFullAccess` to allow the job to query AWS pricing APIs (used to estimate DynamoDB operation costs), or for maximum lockdown allow the `servicequotas:GetServiceQuota` and `servicequotas:GetAWSDefaultServiceQuota` actions.
+* Attach `AWSPriceListServiceFullAccess` to allow querying the AWS pricing APIs to support accurate cost estimates.
+* Attach `ServiceQuotasReadOnlyAccess` (optional) to allow the job to read service quota information.
+* Allow the `application-autoscaling:DescribeScalableTargets` and `application-autoscaling:DescribeScalingPolicies` actions (optional) to support rate-limiting heuristics. These actions do not support resource-level scoping, so they must be granted on `"Resource": "*"`.
 * Add custom IAM permissions for DynamoDB access. You may attach `AmazonDynamoDBReadOnlyAccess` or `AmazonDynamoDBFullAccess`, or define a more restrictive policy targeting specific tables.
+
+When you pass `--XRole`, the bootstrap process checks the role against the requirements above before creating any infrastructure.
+
 
 ### Security: Consider adjusting S3 bucket behaviors
 
@@ -457,20 +490,50 @@ If you ever want to stop execution early, you can hit Control-C. The interrupt w
 * Performs a parallel update of items, based on the update expression keys returned by a Python script. The Python script gets handed each item in the table and can return empty if no update is needed or the parameters for an update expression if an update is needed. The generator script is not expected to perform the update itself.
 * Requires a `generator` parameter to point at the Python script to use. The Glue job calls the `generate()` function within that script repeatedly and in parallel to generate the update expressions to use. The script must exist in the S3 bucket as prepared during the bootstrap. In the likely event you want to use your own generator script, make sure the entity with bootstrap permissions runs bootstrap and includes your generator. The generator scripts are found under the `update` folder.
 * This script does not take a `where` parameter. That logic goes in the generator.
+* Note: **write your update expression so that applying it twice is harmless.** The same item can be updated more than once for two independent reasons, neither of which indicates a problem: Spark retries a failed task (four attempts by default), so every item that task held is processed again; and the DynamoDB SDK retries a request that timed out, which can re-send an `UpdateItem` whose first attempt actually succeeded. An expression that converges — `SET status = :done`, or a counter recomputed from the item's own attributes — is safe. An unguarded accumulation such as `ADD visits :1` or `SET tags = list_append(tags, :new)` is not: it can apply twice and the run will still report success. The simplest guard is a `ConditionExpression`, which is what the shipped `touched` generator uses (`attribute_not_exists(#touched) OR #touched < :touched`) so a repeat is a no-op rather than a second write.
+* Note: the other mutating commands do not need this care, because they write whole items or delete by key — `fill`, `copy`, `load` and `load-export` put items keyed by their primary key, and `delete` removes by key, so repeating the work lands in the same state. It is specific to update expressions, which are relative to whatever the item currently holds.
 
 #### `scancount`
 
 * Performs a parallel scan to count items. Leverages DynamoDB's `Select=COUNT` parameter on the `scan` call so only a count is returned on each internal DynamoDB scan call for maximum performance and memory efficiency.
 * Accepts an optional `index` name to scan an index, suitable if there's an appropriate sparse index that would be faster to scan than the base table.
 * Accepts a `filter-expression` to filter down the items counted. This expression uses the usual DynamoDB syntax. Requires a supporting  `expression-values` parameter and sometimes `expression-names`, as with usual DynamoDB scan calls.
+* Accepts an optional `per-segment` flag to print the item count for each scan segment (sorted descending, with each segment's share of the total). It also reports a skew ratio (hottest segment count / mean) and warns when that ratio exceeds 5x, which indicates an uneven key distribution / hot partition.
+* Accepts an optional `segments` parameter to control how many parallel scan segments are used (default 200). Lower it for small tables; raise it for finer per-segment resolution when diagnosing skew.
+* Accepts an optional `sample-fraction` (`> 0` and `≤ 1.0`, default `1.0`) to scan only a fraction of the segments and extrapolate an estimated total, reported with a 95% confidence interval. Because an unfiltered item count is already available for free (and exact) from `DescribeTable`, sampling is intended to be paired with a `filter-expression`: it estimates how many items match a predicate without paying for a full scan. The margin of error is driven by how evenly matches are spread across segments, so `per-segment` shows the skew behind it (with only one segment sampled, a point estimate is printed without an interval).
 
 #### `diff`
 
 * Performs parallel scans to two tables to compare for differences.
-* Requires `table` and `table2` parameters.
+* Requires `table` and `table2` parameters. Each can be a table name or a table ARN; using ARNs allows cross-account / cross-region access.
 * Accepts an optional `format` which can be `compact` (prints primary keys of all changed items with `+`, `-`, `*` for adds, removes, changes) or `full` (prints the full values of all changed items with `+` and `-` for before and after). Default is `compact`.
 * Accepts an optional `sample-fraction` to indicate a fraction of the two tables to compare, between 0.0 and 1.0. Can help with sanity checking that runs faster and at lower cost.
-* Accepts an optional `s3` parameter to output the result to S3.
+* Always writes the full diff to S3 (under `s3://<bucket>/output/<job-run-id>/`) and prints the first 10 differences to the console with a pointer to the S3 location, like `find` and `sql`. The console preview is capped because console delivery via CloudWatch Live Tail is bandwidth-limited; the complete diff is always in S3.
+
+If diffing cross-account, the table in the other account needs a resource-based policy that allows access. `diff` only reads, so the policy needs just `DescribeTable` and `Scan`. The following example allows two roles in the `123456789012` account: `role/ClientSide` is whatever role runs the command-line program (so the client can describe the table and estimate costs), and `role/AWSGlueServiceRoleBulkDynamoDB-DdbReadOnly-us-east-1` is the read-only role attached to the Glue job (so the scan can be performed).
+
+```
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CrossAccountIdentityBasedPolicy",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::123456789012:role/ClientSide",
+          "arn:aws:iam::123456789012:role/AWSGlueServiceRoleBulkDynamoDB-DdbReadOnly-us-east-1"
+        ]
+      },
+      "Action": [
+        "dynamodb:DescribeTable",
+        "dynamodb:Scan"
+      ],
+      "Resource": "arn:aws:dynamodb:us-west-2:987654321098:table/t2"
+    }
+  ]
+}
+```
 
 #### `load`
 
@@ -596,6 +659,8 @@ These are provided as `--X` flags even though they're actually implemented insid
 
 With `diff` which reads from two tables, the max read rate is applied per table.
 
+At the start of a run the effective rate is also checked against the table's size: if moving the table's data at that rate would take longer than the Glue job timeout (`--XTimeout`, default 60 minutes), a warning is logged that the job will likely time out before finishing — raise the rate or the timeout. The check applies whether the rate was set explicitly or derived from the table's capacity, and is observational only (it never blocks the run). Conversely, a rate below the recommended minimum, or above what the table can actually deliver (its provisioned/autoscaling/on-demand ceiling), is warned about too.
+
 ## Cost management
 
 At the start of each run, each command outputs discovered metrics about the table(s) being used and a cost estimate for any reads and writes that will be performed. If the estimate is too high, you can hit Control-C to cancel the execution. The estimates are rough and not guaranteed. Table metrics use the table metadata available when describing a table, which updates about every 4 hours.
@@ -620,11 +685,12 @@ The e2e harness has these suites:
 
 | Suite | Command | What it checks |
 |-------|---------|----------------|
-| Connector | `make test-e2e-connector` | `count`/`find`/`sql`/`load` against the live DynamoDB DataFrame connector |
+| Connector | `make test-e2e-connector` | `count`/`find`/`sql`/`load` against the live DynamoDB DataFrame connector, plus `scancount` (parallel segmented scan, incl. `--per-segment` skew report) |
 | Commands  | `make test-e2e-commands`  | `fill`/`update`/`delete`/`copy`/`diff` orchestration, each against its own transient table |
 | Security  | `make test-e2e-security`  | the documented bootstrap IAM policy actually bootstraps (and is minimal) |
 | Whole-system | `make test-e2e-whole-system` | true end-to-end: 60k `load` round-trip fidelity + observed write-rate enforcement from CloudWatch |
 | Max-rate | `make test-e2e-max-rate` | **expensive, opt-in:** proves `load` sustains a write rate above the old connector's 60k WCU/s ceiling (millions of items + pre-warmed table) |
+| Capacity warnings | `make test-e2e-capacity-warnings` | issue #89: `load --XMaxWriteRate` above a table's ceiling emits the right warning live (provisioned / autoscaling-max / autoscaling-soft-note / on-demand-max), plus the missing-`DescribeScalableTargets` visibility degradation — asserted in the real Glue job's log stream |
 
 Each command/connector smoke creates its own short-lived table (`bulk-e2e-<command>-<random>`, tagged `ephemeral=true`) and **tears it down in a `finally` block** even on failure — the suite never touches your existing tables. If a run is hard-killed mid-test, sweep any orphans with `make test-e2e-cleanup`. The first e2e run prompts once for account/region/test-table config and caches it in `tests/e2e/.e2e-config` (gitignored, per-developer).
 

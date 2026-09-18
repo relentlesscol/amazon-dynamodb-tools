@@ -182,10 +182,10 @@ class TestReadDataParquetFormat:
         opts = glue_context.create_dynamic_frame.from_options.call_args.kwargs['format_options']
         assert opts['pageSize'] == 512
 
-    def test_parquet_invalid_int_raises_valueerror(self, glue_context):
-        """Line 40: non-integer string for int option raises ValueError."""
+    def test_parquet_invalid_int_raises_bulk_executor_error(self, glue_context):
+        """Non-integer string for an int option raises a clean BulkExecutorError."""
         args = {'format': 'parquet', 'blockSize': 'abc'}
-        with pytest.raises(ValueError, match="Invalid integer for blockSize"):
+        with pytest.raises(load_module.BulkExecutorError, match="Invalid integer for blockSize"):
             load_module.read_data(glue_context, 's3://b/k', args)
 
     def test_parquet_no_options_when_absent(self, glue_context):
@@ -197,12 +197,12 @@ class TestReadDataParquetFormat:
 
 
 class TestReadDataUnknownFormat:
-    """read_data raises ValueError for unrecognized format."""
+    """read_data raises BulkExecutorError for unrecognized format."""
 
     def test_unknown_format_raises(self, glue_context):
-        """Line 58: format not in csv/json/parquet raises."""
+        """format not in csv/json/parquet raises a clean BulkExecutorError."""
         args = {'format': 'avro'}
-        with pytest.raises(ValueError, match="Unexpected format"):
+        with pytest.raises(load_module.BulkExecutorError, match="Unexpected format"):
             load_module.read_data(glue_context, 's3://b/k', args)
 
 
@@ -262,6 +262,7 @@ class TestRunDynamicFrameCount:
     def test_returns_early_when_count_is_zero(self, monkeypatch):
         """Line 92-94: zero items -> early return with error log."""
         monkeypatch.setattr(load_module, 'check_s3_file_exists', lambda uri: True)
+        monkeypatch.setattr(load_module, 's3_source_bytes', lambda uri: 0)
         monkeypatch.setattr(load_module, 'get_dynamodb_throughput_configs',
                             lambda *a, **kw: {})
         glue_ctx = MagicMock()
@@ -273,8 +274,79 @@ class TestRunDynamicFrameCount:
                                  {'table': 't', 's3_path': 's3://b/k', 'format': 'csv'})
         assert result is None
 
+    def test_zero_rows_warns_and_succeeds(self, monkeypatch, caplog):
+        """A run that goes on to succeed must not print an ERROR line. Measured before this
+        change: "ERROR - No data found, please check your data source" immediately above
+        "Job completed successfully", with exit 0."""
+        import logging
+
+        monkeypatch.setattr(load_module, 'check_s3_file_exists', lambda uri: True)
+        # an empty source: nothing to load, which is not the user's mistake
+        monkeypatch.setattr(load_module, 's3_source_bytes', lambda uri: 0)
+        df = MagicMock()
+        df.count.return_value = 0
+        monkeypatch.setattr(load_module, 'read_data', lambda *a: df)
+        write = MagicMock()
+        monkeypatch.setattr(load_module, 'write_dynamodb_dataframe', write)
+
+        with caplog.at_level(logging.WARNING):
+            load_module.run(MagicMock(), MagicMock(), MagicMock(),
+                            {'table': 't', 's3_path': 's3://b/k', 'format': 'json'})
+
+        levels = {r.levelname for r in caplog.records}
+        assert 'ERROR' not in levels, "a successful run must not log an error"
+        message = ' '.join(r.message for r in caplog.records)
+        assert 'Read 0 items' in message and 'source is empty' in message, \
+            "say what happened and what to check"
+        write.assert_not_called()
+
+    def test_zero_rows_from_a_source_with_bytes_is_the_users_mistake(self, monkeypatch):
+        """The wrong-format case. Spark's JSON reader returns no rows where its Parquet
+        reader raises, so without this the same operator error is a clean failure in one
+        format and a silent success in another (#340)."""
+        monkeypatch.setattr(load_module, 'check_s3_file_exists', lambda uri: True)
+        monkeypatch.setattr(load_module, 's3_source_bytes', lambda uri: 4096)
+        df = MagicMock()
+        df.count.return_value = 0
+        monkeypatch.setattr(load_module, 'read_data', lambda *a: df)
+        write = MagicMock()
+        monkeypatch.setattr(load_module, 'write_dynamodb_dataframe', write)
+
+        with pytest.raises(load_module.BulkExecutorError) as exc:
+            load_module.run(MagicMock(), MagicMock(), MagicMock(),
+                            {'table': 't', 's3_path': 's3://b/k/data.json', 'format': 'json'})
+
+        message = str(exc.value)
+        assert not message.startswith('Could not read the source'), (
+            "the zero-row message must not be re-wrapped by the read handler it raises inside; "
+            "a live run produced both messages nested"
+        )
+        assert message.count('Read 0 items') == 1
+        assert '4,096 bytes' in message, "the byte count is the evidence"
+        assert "'json'" in message and '--format' in message
+        assert 'header-only CSV' in message, "name the false positive rather than hide it"
+        write.assert_not_called()
+
+    def test_raises_when_the_frame_cannot_even_be_created(self, monkeypatch):
+        """Parquet reads its footer while the frame is created, so `--format parquet` at a
+        CSV file raises from read_data rather than from count(). Both are the same mistake
+        and must read the same way; measured live before this was wrapped, the Parquet case
+        came out as "Py4JJavaError: ... is not a Parquet file" with a traceback."""
+        monkeypatch.setattr(load_module, 'check_s3_file_exists', lambda uri: True)
+
+        def boom(*_args):
+            raise RuntimeError("s3://b/k/data.csv is not a Parquet file")
+
+        monkeypatch.setattr(load_module, 'read_data', boom)
+
+        with pytest.raises(load_module.BulkExecutorError, match="Could not read the source") as exc:
+            load_module.run(MagicMock(), MagicMock(), MagicMock(),
+                            {'table': 't', 's3_path': 's3://b/k/data.csv', 'format': 'parquet'})
+        assert "'parquet'" in str(exc.value), "name the format the user claimed"
+
     def test_raises_on_count_exception(self, monkeypatch):
-        """Line 99-100: exception during count() re-raises wrapped."""
+        """A failure reading the source is the user's to fix -- wrong --format, malformed
+        data -- so it reports as a sentence naming the path and format (#332)."""
         monkeypatch.setattr(load_module, 'check_s3_file_exists', lambda uri: True)
         monkeypatch.setattr(load_module, 'get_dynamodb_throughput_configs',
                             lambda *a, **kw: {})
@@ -282,9 +354,12 @@ class TestRunDynamicFrameCount:
         df.count.side_effect = RuntimeError('spark error')
         monkeypatch.setattr(load_module, 'read_data', lambda *a: df)
 
-        with pytest.raises(Exception, match="Failed to create DynamicFrame"):
+        with pytest.raises(load_module.BulkExecutorError, match="Could not read the source") as exc:
             load_module.run(MagicMock(), MagicMock(), MagicMock(),
                             {'table': 't', 's3_path': 's3://b/k', 'format': 'csv'})
+        assert "s3://b/k" in str(exc.value) and "'csv'" in str(exc.value), (
+            "name the path and the format the user claimed it was"
+        )
 
 
 class TestRunRemoveEmptyStrings:
@@ -504,6 +579,59 @@ class TestRunWriteRateLimiting:
         assert mock_write.call_args.kwargs['write_rate'] is None
 
 
+# --- s3_source_bytes --------------------------------------------------------
+
+class TestS3SourceBytes:
+    """How much data is behind the path (#340). Called only when a read produced no rows,
+    which is why it may cost an API call at all."""
+
+    def test_single_object_uses_head_object(self, monkeypatch):
+        s3 = MagicMock()
+        s3.head_object.return_value = {'ContentLength': 4096}
+        monkeypatch.setattr(load_module.boto3, 'client', lambda *a, **kw: s3)
+
+        assert load_module.s3_source_bytes('s3://bucket/data.json') == 4096
+        s3.get_paginator.assert_not_called(), "one object needs no listing"
+
+    def test_prefix_sums_every_object_across_pages(self, monkeypatch):
+        from botocore.exceptions import ClientError
+        s3 = MagicMock()
+        s3.head_object.side_effect = ClientError(
+            {'Error': {'Code': '404', 'Message': 'Not Found'}}, 'HeadObject')
+        s3.get_paginator.return_value.paginate.return_value = [
+            {'Contents': [{'Size': 10}, {'Size': 20}]},
+            {'Contents': [{'Size': 5}]},
+        ]
+        monkeypatch.setattr(load_module.boto3, 'client', lambda *a, **kw: s3)
+
+        assert load_module.s3_source_bytes('s3://bucket/prefix/') == 35
+
+    def test_empty_prefix_is_zero_bytes(self, monkeypatch):
+        from botocore.exceptions import ClientError
+        s3 = MagicMock()
+        s3.head_object.side_effect = ClientError(
+            {'Error': {'Code': '404', 'Message': 'Not Found'}}, 'HeadObject')
+        s3.get_paginator.return_value.paginate.return_value = [{}]
+        monkeypatch.setattr(load_module.boto3, 'client', lambda *a, **kw: s3)
+
+        assert load_module.s3_source_bytes('s3://bucket/prefix/') == 0
+
+    def test_other_s3_errors_are_not_swallowed(self, monkeypatch):
+        """A denial here must not be reported as "the source is empty"."""
+        from botocore.exceptions import ClientError
+        s3 = MagicMock()
+        s3.head_object.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'nope'}}, 'HeadObject')
+        monkeypatch.setattr(load_module.boto3, 'client', lambda *a, **kw: s3)
+
+        with pytest.raises(ClientError):
+            load_module.s3_source_bytes('s3://bucket/data.json')
+
+    def test_malformed_uri(self):
+        with pytest.raises(load_module.BulkExecutorError, match="Invalid S3 URI format"):
+            load_module.s3_source_bytes('not-an-s3-uri')
+
+
 # --- check_s3_file_exists ---------------------------------------------------
 
 class TestCheckS3FileExists:
@@ -554,14 +682,14 @@ class TestCheckS3FileExists:
         with pytest.raises(load_module.BulkExecutorError, match="S3 error"):
             load_module.check_s3_file_exists('s3://bucket/key')
 
-    def test_invalid_uri_raises_valueerror(self, monkeypatch):
-        """Line 134-135: URI not matching s3://bucket/key raises."""
-        with pytest.raises(ValueError, match="Invalid S3 URI format"):
+    def test_invalid_uri_raises_bulk_executor_error(self, monkeypatch):
+        """URI not matching s3://bucket/key raises a clean BulkExecutorError."""
+        with pytest.raises(load_module.BulkExecutorError, match="Invalid S3 URI format"):
             load_module.check_s3_file_exists('not-an-s3-uri')
 
     def test_invalid_uri_no_key(self, monkeypatch):
-        """Line 134: s3://bucket with no trailing path doesn't match regex."""
-        with pytest.raises(ValueError, match="Invalid S3 URI format"):
+        """s3://bucket with no trailing path doesn't match regex → BulkExecutorError."""
+        with pytest.raises(load_module.BulkExecutorError, match="Invalid S3 URI format"):
             load_module.check_s3_file_exists('s3://bucket-only')
 
 

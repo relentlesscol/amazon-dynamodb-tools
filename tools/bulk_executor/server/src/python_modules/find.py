@@ -2,7 +2,6 @@ import json
 import math
 import re
 import sys
-import warnings
 
 import boto3
 from awsglue.transforms import *
@@ -14,6 +13,10 @@ from pyspark.sql.functions import asc, desc
 sys.path.append('/server/src')
 from python_modules.shared.bulk_executor_error import BulkExecutorError
 from python_modules.shared.errors import *
+from python_modules.shared.failure_reporter import (
+    MAX_REPORTED_PER_PARTITION,
+    BoundedFailureReporter
+)
 from python_modules.shared.pricing import PricingUtility
 from python_modules.shared.rate_limiter import (
     RateLimiterAggregator,
@@ -25,6 +28,10 @@ from python_modules.shared.table_info import (
     get_and_print_dynamodb_table_info, get_and_print_table_scan_cost,
     get_dynamodb_throughput_configs)
 from python_modules.shared.glue_connector import read_dynamodb_dataframe
+from python_modules.shared.worker_errors import (
+    raise_first_worker_error,
+    record_worker_failure
+)
 
 
 def print_dynamodb_table_info(table_name, is_delete, **kwargs):
@@ -89,9 +96,9 @@ def run(job, spark_context, glue_context, parsed_args):
                 elif order == 'desc':
                     sort_order_list.append(desc(column))
                 else:
-                    raise ValueError(f"Invalid sort order: {order}")
+                    raise BulkExecutorError(f"Invalid sort order: {order}")
             else:
-                raise ValueError(f"Invalid sort specification: {spec}")
+                raise BulkExecutorError(f"Invalid sort specification: {spec}")
         return sort_order_list
 
     if ORDERBY:
@@ -106,8 +113,8 @@ def run(job, spark_context, glue_context, parsed_args):
 
     # OK, we're gonna convert the DynamicFrame to a DataFrame for processing
     else:
-        # Suppress dataframe.py warning that might confuse users
-        warnings.filterwarnings("ignore", message="DataFrame constructor is internal. Do not directly use it.")
+        # The "DataFrame constructor is internal" warning is suppressed once in
+        # server/src/root.py for every verb.
         records = read_dynamodb_dataframe(
             glue_context, DYNAMO_DB_TABLE_NAME, parsed_args,
             splits=DYNAMO_DB_NUMBER_OF_SPLITS)
@@ -181,7 +188,14 @@ def run(job, spark_context, glue_context, parsed_args):
         elif DO_DELETE:
             keys = get_table_keys(DYNAMO_DB_TABLE_NAME)
 
-            def delete_partition(monitor_options, partition, shared_config):
+            def delete_partition(monitor_options, partition, shared_config,
+                                 failure_accumulator, delete_error_accumulator):
+                # Failures are counted into the accumulator so the driver can tell the
+                # user how many there were, and only the first few are logged per
+                # partition. This runs in a worker, so nothing printed here reaches the
+                # console -- it exists for CloudWatch after the fact. See
+                # shared/failure_reporter.py.
+                failures = BoundedFailureReporter('Delete', failure_accumulator)
                 rate_limiter_worker = RateLimiterWorker(
                     shared_config=rate_limiter_shared_config,
                     **monitor_options
@@ -201,12 +215,22 @@ def run(job, spark_context, glue_context, parsed_args):
                 try:
                     with table.batch_writer() as batch:
                         for record in partition:
+                            # Set before the try so the failure path never reports a
+                            # stale key from the previous iteration -- and never trips
+                            # over an unbound name when json.loads is what failed.
+                            key = None
                             try:
                                 item = json.loads(record)
                                 key = {k: item[k] for k in keys}
                                 batch.delete_item(Key=key)
                             except Exception as e:
-                                print(f"Error deleting item {item}: {e}")
+                                # The key, not the item: an item can be 400 KB, and a
+                                # systemic failure would log one per row.
+                                failures.report(key if key else record[:200], e)
+                except Exception as e:
+                    # batch_writer buffers 25 items and flushes on exit, so a denied or
+                    # throttled write raises here, outside the per-item handler above.
+                    record_worker_failure(delete_error_accumulator, e, "Error during delete")
                 finally:
                     rate_limiter_worker.shutdown()
 
@@ -232,13 +256,27 @@ def run(job, spark_context, glue_context, parsed_args):
             rate_limiter_aggregator = RateLimiterAggregator(shared_config=rate_limiter_shared_config)
 
             monitor_options = get_dynamodb_throughput_configs(parsed_args, DYNAMO_DB_TABLE_NAME, modes=["write"], format="monitor")
+            delete_failure_accumulator = spark_context.accumulator(0)
+            delete_error_accumulator = spark_context.accumulator([], ListAccumulator())
             try:
                 records.toJSON().foreachPartition(
-                    lambda partition: delete_partition(monitor_options, partition, rate_limiter_shared_config)
+                    lambda partition: delete_partition(monitor_options, partition, rate_limiter_shared_config, delete_failure_accumulator, delete_error_accumulator)
                 )
             finally:
                 rate_limiter_aggregator.shutdown()
-            print(f"Deleted {count:,} items")
+
+            # A batch-level failure means the delete did not do what was asked, so it
+            # is fatal rather than a count to report.
+            raise_first_worker_error(delete_error_accumulator)
+
+            # Report failures rather than claiming every matched item was deleted. The
+            # per-item detail is in the executor logs, which the console never shows.
+            failed = delete_failure_accumulator.value
+            if failed:
+                print(f"Deleted {count - failed:,} items, {failed:,} failed")
+                print(f"Up to {MAX_REPORTED_PER_PARTITION} failures per partition are logged in CloudWatch under /aws-glue/jobs/output, in the streams ending '_g-<id>'")
+            else:
+                print(f"Deleted {count:,} items")
 
         else:
             raise ValueError("Logic error, don't know what action to take")
