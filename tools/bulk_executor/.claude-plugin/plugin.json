@@ -1,0 +1,27 @@
+{
+  "name": "dynamodb-bulk-executor",
+  "displayName": "Bulk Executor for Amazon DynamoDB",
+  "version": "0.1.0",
+  "description": "Run bulk operations against large Amazon DynamoDB tables — count, find, scan, SQL, update, delete, fill, copy, diff, load, and export replay — using an AWS Glue Spark job for massive parallelism.",
+  "author": {
+    "name": "Amazon DynamoDB Tools",
+    "url": "https://github.com/awslabs/amazon-dynamodb-tools"
+  },
+  "homepage": "https://github.com/awslabs/amazon-dynamodb-tools/tree/main/tools/bulk_executor",
+  "repository": "https://github.com/awslabs/amazon-dynamodb-tools",
+  "license": "Apache-2.0",
+  "keywords": [
+    "dynamodb",
+    "aws",
+    "glue",
+    "spark",
+    "bulk",
+    "bulk-update",
+    "bulk-delete",
+    "backfill",
+    "table-copy",
+    "table-diff",
+    "point-in-time-recovery",
+    "data-migration"
+  ]
+}

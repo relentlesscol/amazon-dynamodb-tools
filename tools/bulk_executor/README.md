@@ -694,6 +694,15 @@ The e2e harness has these suites:
 
 Each command/connector smoke creates its own short-lived table (`bulk-e2e-<command>-<random>`, tagged `ephemeral=true`) and **tears it down in a `finally` block** even on failure — the suite never touches your existing tables. If a run is hard-killed mid-test, sweep any orphans with `make test-e2e-cleanup`. The first e2e run prompts once for account/region/test-table config and caches it in `tests/e2e/.e2e-config` (gitignored, per-developer).
 
+## Using Bulk Executor from Claude Code
+
+A Claude Code plugin ships in [`skills/`](skills/README.md) — one agent skill per command, plus helpers for setup, tuning, troubleshooting and writing custom verbs. It is documentation only and changes no tool behaviour.
+
+```
+/plugin marketplace add awslabs/amazon-dynamodb-tools
+/plugin install dynamodb-bulk-executor@amazon-dynamodb-tools
+```
+
 ## Extensibility (writing custom command scripts)
 
 There are two parts to the bulk executor: the harness and the individual command scripts (the verbs). The core commands are each just Python scripts called by the harness and leveraging the parallelization abilities of Glue Spark. There's a client-side component to each command (a chance to do quick parameter validation, check for table existence, etc) and a server-side component (to perform the bulk execution).

@@ -1,0 +1,47 @@
+{
+  "name": "dynamodb-bulk-executor",
+  "version": "0.1.0",
+  "description": "Run bulk operations against large Amazon DynamoDB tables — count, find, scan, SQL, update, delete, fill, copy, diff, load, and export replay — using an AWS Glue Spark job for massive parallelism.",
+  "author": {
+    "name": "Amazon DynamoDB Tools",
+    "url": "https://github.com/awslabs/amazon-dynamodb-tools"
+  },
+  "homepage": "https://github.com/awslabs/amazon-dynamodb-tools/tree/main/tools/bulk_executor",
+  "repository": "https://github.com/awslabs/amazon-dynamodb-tools",
+  "license": "Apache-2.0",
+  "keywords": [
+    "dynamodb",
+    "aws",
+    "glue",
+    "spark",
+    "bulk",
+    "bulk-update",
+    "bulk-delete",
+    "backfill",
+    "table-copy",
+    "table-diff",
+    "point-in-time-recovery",
+    "data-migration"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Bulk Executor for Amazon DynamoDB",
+    "shortDescription": "Count, query, backfill, copy and diff huge DynamoDB tables via AWS Glue.",
+    "longDescription": "Drive Bulk Executor for Amazon DynamoDB: run bulk operations across tables far too large for a scripted loop, using an AWS Glue Spark job for parallelism. Covers counting and finding with Spark SQL predicates, sorting on any attribute without a GSI, parallel-scan counts with skew reporting, arbitrary Spark SQL, generator-driven updates and backfills, deletes, synthetic data fills, cross-region and cross-account copies and diffs, S3 loads, and replaying or reverting DynamoDB exports — with the cost, capacity and point-in-time-recovery guardrails each one requires.",
+    "defaultPrompt": [
+      "How many items in my DynamoDB table match this condition?",
+      "Backfill a new attribute across every item in this table.",
+      "Compare these two DynamoDB tables and tell me what differs."
+    ],
+    "developerName": "Amazon DynamoDB Tools",
+    "category": "Database",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/awslabs/amazon-dynamodb-tools/tree/main/tools/bulk_executor",
+    "privacyPolicyURL": "https://aws.amazon.com/privacy/",
+    "termsOfServiceURL": "https://aws.amazon.com/service-terms/",
+    "brandColor": "#FF9900"
+  }
+}
