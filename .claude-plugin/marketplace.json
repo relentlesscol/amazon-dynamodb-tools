@@ -1,0 +1,35 @@
+{
+  "name": "amazon-dynamodb-tools",
+  "description": "Claude Code plugins for the tools in awslabs/amazon-dynamodb-tools.",
+  "owner": {
+    "name": "Amazon DynamoDB Tools",
+    "url": "https://github.com/awslabs/amazon-dynamodb-tools"
+  },
+  "plugins": [
+    {
+      "name": "dynamodb-bulk-executor",
+      "source": "./tools/bulk_executor",
+      "description": "Run bulk operations against large Amazon DynamoDB tables — count, find, scan, SQL, update, delete, fill, copy, diff, load, and export replay — using an AWS Glue Spark job for massive parallelism.",
+      "version": "0.1.0",
+      "category": "database",
+      "author": {
+        "name": "Amazon DynamoDB Tools",
+        "url": "https://github.com/awslabs/amazon-dynamodb-tools"
+      },
+      "homepage": "https://github.com/awslabs/amazon-dynamodb-tools/tree/main/tools/bulk_executor",
+      "license": "Apache-2.0",
+      "keywords": [
+        "dynamodb",
+        "aws",
+        "glue",
+        "spark",
+        "bulk",
+        "backfill",
+        "table-copy",
+        "table-diff",
+        "data-migration"
+      ],
+      "tags": ["aws", "dynamodb", "database", "bulk-operations"]
+    }
+  ]
+}
